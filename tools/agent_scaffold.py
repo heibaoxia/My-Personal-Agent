@@ -30,10 +30,13 @@ import validate_scaffold
 
 
 SCHEMA_VERSION = 1
-TOOL_VERSION = "2.0.0"
+TOOL_VERSION = "3.0.0"
 MANIFEST_FILE = ".agent/scaffold-manifest.json"
 DESCRIPTION_FILE = validate_scaffold.DESCRIPTION_FILE
 ARCHITECT_ROOT = ".agent/architect/"
+EVALUATION_VERSION = "1"
+EVALUATION_SKILL = "scaffold-evaluate"
+EVALUATION_FILE = ".agent/skills/scaffold-evaluate.md"
 CANONICAL_REPOSITORY = "heibaoxia/My-Personal-Agent"
 CANONICAL_REPOSITORY_URL = "https://github.com/" + CANONICAL_REPOSITORY
 CANONICAL_API_URL = "https://api.github.com/repos/%s/releases/latest" % CANONICAL_REPOSITORY
@@ -944,18 +947,33 @@ def load_package_manifest(workspace: str, text: str | None = None) -> dict:
         if not isinstance(manifest.get("exclusions"), list) or not all(isinstance(item, str) for item in manifest["exclusions"]):
             raise ValueError("manifest needs an exclusions list")
         points = manifest.get("entrypoints")
-        if not isinstance(points, dict) or set(points) != {"initialSkill", "archiveSkill", "architectSkill", "architectCli"}:
+        roles = {"initialSkill", "archiveSkill", "architectSkill", "architectCli"}
+        evaluation = "evaluationVersion" in manifest or (isinstance(points, dict) and "evaluationSkill" in points)
+        if evaluation:
+            roles.add("evaluationSkill")
+            if manifest.get("evaluationVersion") != EVALUATION_VERSION or not isinstance(points, dict) or points.get("evaluationSkill") != EVALUATION_SKILL:
+                raise ValueError("evaluationVersion 1 and the fixed scaffold-evaluate entrypoint are required")
+        if not isinstance(points, dict) or set(points) != roles:
             raise ValueError("manifest needs initial/archive/architect entrypoints")
         if any(not isinstance(points[key], str) or not validate_scaffold.SLUG_RE.fullmatch(points[key]) for key in ("initialSkill", "archiveSkill", "architectSkill")):
             raise ValueError("Skill entrypoints must be slugs")
         if len({points[key] for key in ("initialSkill", "archiveSkill", "architectSkill")}) != 3:
             raise ValueError("initial, archive and architect Skills must be distinct")
+        if evaluation and EVALUATION_SKILL in (points[key] for key in ("initialSkill", "archiveSkill", "architectSkill")):
+            raise ValueError("evaluation Skill must have a distinct role")
         if points["architectCli"] not in protected or not points["architectCli"].startswith(ARCHITECT_ROOT) or not points["architectCli"].endswith("/agent_scaffold.py"):
             raise ValueError("architect CLI must be a protected agent_scaffold.py")
         if ".agent/skills/" + points["architectSkill"] + ".md" not in protected:
             raise ValueError("architect Skill must be protected")
-        if any(not rel.startswith(ARCHITECT_ROOT) and rel != ".agent/skills/" + points["architectSkill"] + ".md" for rel in protected):
-            raise ValueError("protected Skills may only contain the architect entrypoint")
+        protected_skills = {".agent/skills/" + points["architectSkill"] + ".md"}
+        if evaluation:
+            protected_skills.add(EVALUATION_FILE)
+            helper = str(Path(points["architectCli"]).with_name("agent_evaluation.py")).replace("\\", "/")
+            rules = str(Path(points["architectCli"]).with_name("scaffold-evaluate.md")).replace("\\", "/")
+            if not {EVALUATION_FILE, helper, rules}.issubset(protected):
+                raise ValueError("evaluation Skill, canonical rules and agent_evaluation.py must be protected")
+        if any(not rel.startswith(ARCHITECT_ROOT) and rel not in protected_skills for rel in protected):
+            raise ValueError("protected Skills may only contain architect and evaluation entrypoints")
         if not {"AGENTS.md", DESCRIPTION_FILE}.issubset(files):
             raise ValueError("manifest must include entry and Description")
         description = manifest.get("description")
@@ -978,6 +996,8 @@ def formal_delivery(workspace: str) -> dict:
                       sourceRepository=manifest.get("sourceRepository"),
                       sourceCommit=manifest.get("sourceCommit"),
                       manifestFormat=manifest.get("manifestFormat"),
+                      evaluationVersion=manifest.get("evaluationVersion"),
+                      evaluationStatus="available" if "evaluationVersion" in manifest else "legacy",
                       manifest=MANIFEST_FILE, protectedFiles=manifest["protectedFiles"])
         report["files"] = manifest["files"]
         for rel, expected in manifest["files"].items():
@@ -990,7 +1010,12 @@ def formal_delivery(workspace: str) -> dict:
         entry, indexes = inspect_entry(workspace)
         skills = {item["id"]: item["path"] for item in indexes if item["type"] == "skill"}
         points = manifest["entrypoints"]
-        for role in ("initialSkill", "archiveSkill", "architectSkill"):
+        roles = ["initialSkill", "archiveSkill", "architectSkill"]
+        if "evaluationVersion" in manifest:
+            roles.append("evaluationSkill")
+        else:
+            errors.append(error("DELIVERY_EVALUATION_MISSING", "legacy package lacks the default evaluation capability; use a controlled upgrade", EVALUATION_FILE))
+        for role in roles:
             ident = points[role]
             rel = skills.get(ident)
             if rel is None or rel not in manifest["files"]:
@@ -1014,6 +1039,19 @@ def formal_delivery(workspace: str) -> dict:
             errors.append(error("DELIVERY_CLI_DEPENDENCY_MISSING", "self-contained CLI needs protected validate_scaffold.py", companion))
         if architect and cli not in (path_bytes(workspace, architect) or b"").decode("utf-8", "replace"):
             errors.append(error("DELIVERY_CLI_NOT_DISCOVERABLE", "architect Skill must point to its workspace-relative CLI", architect))
+        if "evaluationVersion" in manifest:
+            evaluation = skills.get(EVALUATION_SKILL)
+            helper = str(Path(cli).with_name("agent_evaluation.py")).replace("\\", "/")
+            if evaluation != EVALUATION_FILE:
+                errors.append(error("DELIVERY_EVALUATION_MISSING", "evaluation Skill must be indexed at its fixed path", EVALUATION_FILE))
+            elif evaluation:
+                block, _ = validate_scaffold.Validator(workspace, validate_scaffold.Collector()).parse_document(evaluation, True)
+                data = block.data if block and isinstance(block.data, dict) else {}
+                text = (path_bytes(workspace, evaluation) or b"").decode("utf-8", "replace")
+                if data.get("sideEffects") != "writes-workspace" or data.get("confirmation") != "required":
+                    errors.append(error("DELIVERY_EVALUATION_POLICY", "evaluation needs writes-workspace and required confirmation", evaluation))
+                if not data.get("implementation") or not validate_scaffold.description_body(text).strip() or helper not in text:
+                    errors.append(error("DELIVERY_EVALUATION_TOOL_MISSING", "evaluation Skill must contain rules and locate protected agent_evaluation.py", evaluation))
         archive = skills.get(points["archiveSkill"])
         if archive:
             archive_text = (path_bytes(workspace, archive) or b"").decode("utf-8", "replace")
@@ -1034,7 +1072,9 @@ def formal_delivery(workspace: str) -> dict:
     for item in errors:
         collector.add(item)
     report["errors"] = validate_scaffold.sorted_errors(collector.items)
-    report["status"] = "complete" if not report["errors"] else "intermediate"
+    report["status"] = ("complete" if not report["errors"] else "legacy"
+                        if report.get("evaluationStatus") == "legacy" and all(item["code"] == "DELIVERY_EVALUATION_MISSING" for item in report["errors"])
+                        else "intermediate")
     return report
 
 
@@ -1056,13 +1096,7 @@ def check_maintenance_boundaries(workspace: str, plan: dict) -> None:
     for rel in plan["files"]:
         if rel.startswith(ARCHITECT_ROOT) and (not new or rel not in new["protectedFiles"]):
             raise PlanError("ARCHITECT_PROTECTED", "architect paths require a protected manifest declaration", rel)
-    requires_description = (
-        old is not None and (
-            DESCRIPTION_FILE in plan["files"] or MANIFEST_FILE in plan["files"] or
-            "AGENTS.md" in plan["files"] or any(rel in old["protectedFiles"] for rel in plan["files"])
-        )
-    ) or DESCRIPTION_FILE in plan["files"]
-    if requires_description:
+    if old or new or DESCRIPTION_FILE in plan["files"]:
         if DESCRIPTION_FILE not in plan["files"] or plan.get("descriptionSync") not in ("updated", "unchanged"):
             raise PlanError("DESCRIPTION_SYNC_MISSING", "include complete Description, baseline and descriptionSync updated/unchanged", DESCRIPTION_FILE)
         target = plan["files"][DESCRIPTION_FILE]
@@ -1231,6 +1265,8 @@ def package_operation(operation: str, workspace: str, source: str | None, confir
                               sourceCommit=bundle_manifest["sourceCommit"],
                               assetName=bundle_manifest["assetName"],
                               manifest="architect-bundle-manifest.json",
+                              evaluationVersion=bundle_manifest.get("evaluationVersion"),
+                              evaluationStatus="available" if "evaluationVersion" in bundle_manifest else "legacy",
                               files=bundle_manifest["files"],
                               protectedFiles=bundle_manifest["protectedFiles"])
                 return result, 0
@@ -1282,6 +1318,15 @@ def package_operation(operation: str, workspace: str, source: str | None, confir
                 installed["files"].update({rel: incoming["files"][rel] for rel in incoming["protectedFiles"]})
                 installed["protectedFiles"] = incoming["protectedFiles"]
                 installed["entrypoints"]["architectCli"] = incoming["entrypoints"]["architectCli"]
+                if "evaluationVersion" in incoming:
+                    installed["evaluationVersion"] = incoming["evaluationVersion"]
+                    installed["entrypoints"]["evaluationSkill"] = EVALUATION_SKILL
+                    entry = _entry_with_evaluation(workspace)
+                    if entry != path_bytes(workspace, "AGENTS.md"):
+                        files["AGENTS.md"] = entry.decode("utf-8")
+                        installed["files"]["AGENTS.md"] = sha256_bytes(entry)
+                elif "evaluationVersion" in installed:
+                    raise PlanError("PACKAGE_EVALUATION_DOWNGRADE", "upgrade cannot remove the default evaluation capability")
                 installed["packageVersion"] = incoming["packageVersion"]
                 installed["source"] = incoming["source"]
                 if "bundleVersion" in incoming:
@@ -1344,7 +1389,8 @@ def _release_url(url: str, *, api: bool = False) -> urllib.parse.ParseResult:
         parsed = urllib.parse.urlparse(url)
     except (TypeError, ValueError) as exc:
         raise _release_error("RELEASE_SOURCE_INVALID", "Release source URL is invalid", url) from exc
-    if parsed.scheme != "https" or parsed.username or parsed.password or parsed.fragment:
+    if (parsed.scheme != "https" or parsed.username or parsed.password or parsed.fragment
+            or parsed.port not in (None, 443)):
         raise _release_error("RELEASE_SOURCE_INVALID", "Release source must use HTTPS without credentials or fragments", url)
     host = (parsed.hostname or "").lower()
     if api:
@@ -1365,7 +1411,8 @@ def _bounded_url_bytes(url: str, limit: int, *, api: bool = False) -> bytes:
         "User-Agent": "personal-agent-scaffold/%s" % TOOL_VERSION,
     })
     try:
-        with urllib.request.urlopen(request, timeout=RELEASE_TIMEOUT_SECONDS) as response:
+        opener = urllib.request.build_opener(_ReleaseRedirect())
+        with opener.open(request, timeout=RELEASE_TIMEOUT_SECONDS) as response:
             length = response.headers.get("Content-Length") if getattr(response, "headers", None) else None
             if length is not None:
                 try:
@@ -1390,6 +1437,17 @@ def _bounded_url_bytes(url: str, limit: int, *, api: bool = False) -> bytes:
         raise _release_error("RELEASE_OFFLINE", "Unable to retrieve canonical Release: %s" % exc, url) from exc
 
 
+class _ReleaseRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, response, code, message, headers, url):
+        parsed = urllib.parse.urlparse(url)
+        if (parsed.scheme != "https" or parsed.username or parsed.password
+                or parsed.port not in (None, 443) or parsed.hostname not in (
+                    "api.github.com", "github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"
+                )):
+            raise _release_error("RELEASE_SOURCE_INVALID", "Release redirect must remain on trusted GitHub HTTPS hosts", url)
+        return super().redirect_request(request, response, code, message, headers, url)
+
+
 def _release_version(value: object) -> tuple[int, int, int]:
     if not isinstance(value, str):
         raise ValueError("Release version must be a major.minor.patch string")
@@ -1412,6 +1470,8 @@ def _extract_release_zip(data: bytes, destination: str) -> str:
             expanded = 0
             for item in entries:
                 raw_name = item.filename.replace("\\", "/")
+                if item.flag_bits & 1:
+                    raise _release_error("PACKAGE_INVALID", "Release ZIP must not contain encrypted files", raw_name)
                 mode = (item.external_attr >> 16) & 0o170000
                 if mode == 0o120000:
                     raise _release_error("PACKAGE_SOURCE_FAILED", "Release ZIP contains symbolic links", raw_name)
@@ -1430,7 +1490,7 @@ def _extract_release_zip(data: bytes, destination: str) -> str:
                 target.write_bytes(zipped.read(item))
     except zipfile.BadZipFile as exc:
         raise _release_error("PACKAGE_INVALID", "Release asset is not a valid ZIP archive") from exc
-    except (OSError, KeyError) as exc:
+    except (OSError, KeyError, RuntimeError, NotImplementedError) as exc:
         raise _release_error("PACKAGE_INVALID", str(exc)) from exc
     return str(package)
 
@@ -1442,7 +1502,7 @@ def _read_architect_bundle_manifest(root: str) -> dict:
         manifest = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_manifest_pairs)
     except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
         raise _release_error("PACKAGE_INVALID", "architect bundle manifest is unreadable", str(path)) from exc
-    if not isinstance(manifest, dict) or manifest.get("schemaVersion") != 1:
+    if not isinstance(manifest, dict) or type(manifest.get("schemaVersion")) is not int or manifest["schemaVersion"] != 1:
         raise _release_error("PACKAGE_INVALID", "architect bundle manifest schemaVersion must be 1", str(path))
     version = manifest.get("bundleVersion")
     try:
@@ -1460,10 +1520,23 @@ def _read_architect_bundle_manifest(root: str) -> dict:
     files = manifest.get("files")
     protected = manifest.get("protectedFiles")
     points = manifest.get("entrypoints")
-    if not isinstance(files, dict) or not files or not isinstance(protected, list) or sorted(protected) != sorted(files) or len(protected) != len(set(protected)):
+    if (not isinstance(files, dict) or not files or not isinstance(protected, list)
+            or not all(isinstance(rel, str) for rel in protected)
+            or sorted(protected) != sorted(files) or len(protected) != len(set(protected))):
         raise _release_error("PACKAGE_INVALID", "architect bundle files/protectedFiles are inconsistent", str(path))
-    if not isinstance(points, dict) or set(points) != {"skill", "cli", "validator"} or any(points[key] not in files for key in points):
+    roles = {"skill", "cli", "validator"}
+    if "evaluationVersion" in manifest:
+        if manifest["evaluationVersion"] != EVALUATION_VERSION:
+            raise _release_error("PACKAGE_INVALID", "unsupported evaluationVersion", str(path))
+        roles.update(("evaluationSkill", "evaluationTool"))
+    if (not isinstance(points, dict) or set(points) != roles
+            or any(not isinstance(points[key], str) or points[key] not in files for key in points)):
         raise _release_error("PACKAGE_INVALID", "architect bundle entrypoints are incomplete", str(path))
+    if "evaluationVersion" in manifest:
+        helper = str(Path(points["cli"]).with_name("agent_evaluation.py")).replace("\\", "/")
+        rules = str(Path(points["cli"]).with_name("scaffold-evaluate.md")).replace("\\", "/")
+        if points["evaluationSkill"] != EVALUATION_FILE or points["evaluationTool"] != helper or rules not in files:
+            raise _release_error("PACKAGE_INVALID", "evaluation bundle paths or canonical rules are incomplete", str(path))
     for rel, expected in files.items():
         try:
             safe_rel(rel)
@@ -1511,6 +1584,8 @@ def _release_candidate(source: str | None, temp: str) -> tuple[str, dict]:
         data = _bounded_url_bytes(metadata_url, RELEASE_ARCHIVE_LIMIT)
         package = _extract_release_zip(data, temp)
         manifest, bundle = _candidate_manifest(package)
+        if manifest.get("assetName") != asset_name:
+            raise _release_error("PACKAGE_INVALID", "Release manifest version differs from asset", asset_name)
         return package, {"source": metadata_url, "manifest": manifest, "bundle": bundle, "assetName": asset_name, "verified": True}
 
     _release_url(metadata_url, api=True)
@@ -1521,25 +1596,17 @@ def _release_candidate(source: str | None, temp: str) -> tuple[str, dict]:
         raise _release_error("PACKAGE_INVALID", "Release metadata is not valid JSON", metadata_url) from exc
     if not isinstance(payload, dict):
         raise _release_error("PACKAGE_INVALID", "Release metadata must be an object", metadata_url)
-    html_url = payload.get("html_url")
-    repository = payload.get("url", "")
-    canonical_html = False
-    canonical_api = False
-    if isinstance(html_url, str):
-        parsed_html = urllib.parse.urlparse(html_url)
-        canonical_html = (parsed_html.scheme == "https" and parsed_html.hostname == "github.com" and
-                          parsed_html.path.rstrip("/") == "/" + CANONICAL_REPOSITORY and not parsed_html.query and not parsed_html.fragment)
-    if isinstance(repository, str):
-        parsed_repo = urllib.parse.urlparse(repository)
-        canonical_api = (parsed_repo.scheme == "https" and parsed_repo.hostname == "api.github.com" and
-                         parsed_repo.path.rstrip("/") == "/repos/" + CANONICAL_REPOSITORY and not parsed_repo.query and not parsed_repo.fragment)
-    if not canonical_html and not canonical_api:
-        raise _release_error("RELEASE_SOURCE_INVALID", "Release metadata is not from the canonical repository", metadata_url)
     tag = payload.get("tag_name")
     try:
         version = _release_version(tag)
     except ValueError as exc:
         raise _release_error("PACKAGE_INVALID", str(exc), "tag_name") from exc
+    release_id = payload.get("id")
+    if type(release_id) is not int or release_id <= 0 or payload.get("draft") is not False or payload.get("prerelease") is not False:
+        raise _release_error("PACKAGE_INVALID", "canonical Release must be a published stable version", metadata_url)
+    if (payload.get("html_url") != "https://github.com/%s/releases/tag/%s" % (CANONICAL_REPOSITORY, tag)
+            or payload.get("url") != "https://api.github.com/repos/%s/releases/%d" % (CANONICAL_REPOSITORY, release_id)):
+        raise _release_error("RELEASE_SOURCE_INVALID", "Release metadata is not from the canonical repository", metadata_url)
     asset_name = "%s%d.%d.%d%s" % ((RELEASE_ASSET_PREFIX,) + version + (RELEASE_ASSET_SUFFIX,))
     assets = payload.get("assets")
     if not isinstance(assets, list):
@@ -1549,6 +1616,8 @@ def _release_candidate(source: str | None, temp: str) -> tuple[str, dict]:
         raise _release_error("PACKAGE_INVALID", "canonical Release asset is missing", asset_name)
     download_url = asset["browser_download_url"]
     _release_url(download_url)
+    if download_url != "https://github.com/%s/releases/download/%s/%s" % (CANONICAL_REPOSITORY, tag, asset_name):
+        raise _release_error("RELEASE_SOURCE_INVALID", "Release asset does not belong to the selected version", download_url)
     data = _bounded_url_bytes(download_url, RELEASE_ARCHIVE_LIMIT)
     expected_digest = asset.get("digest")
     if isinstance(expected_digest, str) and expected_digest.startswith("sha256:"):
@@ -1557,6 +1626,8 @@ def _release_candidate(source: str | None, temp: str) -> tuple[str, dict]:
             raise _release_error("PACKAGE_INVALID", "Release asset SHA-256 does not match metadata", asset_name)
     package = _extract_release_zip(data, temp)
     manifest, bundle = _candidate_manifest(package)
+    if _manifest_version(manifest) != version or manifest.get("assetName") != asset_name:
+        raise _release_error("PACKAGE_INVALID", "Release manifest version differs from tag or asset", asset_name)
     return package, {"source": CANONICAL_REPOSITORY, "manifest": manifest, "assetName": asset_name,
                      "assetUrl": download_url, "tag": tag, "sourceCommit": payload.get("target_commitish"),
                      "bundle": bundle, "verified": True}
@@ -1622,7 +1693,43 @@ def _bundle_target_files(bundle: str, bundle_manifest: dict, workspace: str, ins
     if source_release in bundle_manifest["files"]:
         target_release = str(Path(target_cli_rel).with_name("release.json")).replace("\\", "/")
         mapped[target_release] = path_bytes(bundle, source_release)
+    if "evaluationVersion" in bundle_manifest:
+        helper = str(Path(target_cli_rel).with_name("agent_evaluation.py")).replace("\\", "/")
+        mapped[EVALUATION_FILE] = _bundle_file(bundle, bundle_manifest, "evaluationSkill").replace(
+            b".agent/architect/tools", str(Path(target_cli_rel).parent).replace("\\", "/").encode("utf-8"))
+        mapped[helper] = _bundle_file(bundle, bundle_manifest, "evaluationTool")
+        source_rules = str(Path(bundle_manifest["entrypoints"]["cli"]).with_name("scaffold-evaluate.md")).replace("\\", "/")
+        if source_rules not in bundle_manifest["files"]:
+            raise PlanError("PACKAGE_INVALID", "evaluation bundle lacks its canonical rule source", source_rules)
+        target_rules = str(Path(target_cli_rel).with_name("scaffold-evaluate.md")).replace("\\", "/")
+        mapped[target_rules] = path_bytes(bundle, source_rules)
     return mapped
+
+
+def _entry_with_evaluation(workspace: str) -> bytes:
+    """Add the fixed index entry while preserving existing root rule text."""
+    data = path_bytes(workspace, "AGENTS.md") or b""
+    _, indexes = inspect_entry(workspace)
+    for item in indexes:
+        if item["id"] == EVALUATION_SKILL or item["path"] == EVALUATION_FILE:
+            if item["type"] == "skill" and item["id"] == EVALUATION_SKILL and item["path"] == EVALUATION_FILE:
+                return data
+            raise PlanError("PACKAGE_ENTRYPOINT_CONFLICT", "fixed evaluation index conflicts with an existing object", item["path"])
+    text = data.decode("utf-8")
+    lines = text.splitlines(keepends=True)
+    block, _ = validate_scaffold.Validator(workspace, validate_scaffold.Collector()).parse_document("AGENTS.md", True)
+    if not block or "skills" not in block.lines:
+        raise PlanError("PACKAGE_ENTRYPOINT_CONFLICT", "formal root entry has no Skills index", "AGENTS.md")
+    start = block.lines["skills"]
+    insertion = start + 1
+    while insertion < len(lines) and (not lines[insertion].strip() or lines[insertion].startswith(" ") or lines[insertion].lstrip().startswith("#")):
+        insertion += 1
+    newline = "\r\n" if "\r\n" in text else "\n"
+    indent = next((len(line) - len(line.lstrip()) for line in lines[start + 1:insertion] if line.lstrip().startswith("- ")), 2)
+    item = " " * indent + "- id: " + EVALUATION_SKILL + newline
+    item += " " * (indent + 2) + "path: " + EVALUATION_FILE + newline
+    lines.insert(insertion, item)
+    return "".join(lines).encode("utf-8")
 
 
 def _materialize_bundle_for_target(bundle: str, bundle_manifest: dict, workspace: str, temp: str) -> str:
@@ -1654,6 +1761,12 @@ def _materialize_bundle_for_target(bundle: str, bundle_manifest: dict, workspace
     for rel, data in mapped.items():
         synthetic["files"][rel] = sha256_bytes(data)
     synthetic["protectedFiles"] = sorted(mapped)
+    if "evaluationVersion" in bundle_manifest:
+        synthetic["evaluationVersion"] = bundle_manifest["evaluationVersion"]
+        synthetic["entrypoints"] = {**installed["entrypoints"], "evaluationSkill": EVALUATION_SKILL}
+        entry = _entry_with_evaluation(workspace)
+        (stage / "AGENTS.md").write_bytes(entry)
+        synthetic["files"]["AGENTS.md"] = sha256_bytes(entry)
     (stage / MANIFEST_FILE).parent.mkdir(parents=True, exist_ok=True)
     (stage / MANIFEST_FILE).write_text(json.dumps(synthetic, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8", newline="\n")
     return str(stage)
@@ -1684,6 +1797,14 @@ def preflight_operation(workspace: str, source: str | None = None) -> tuple[dict
             result.update(status="conflict", reason="protected-files-modified", nextAction="resolve-conflict",
                           errors=[error("PACKAGE_BASELINE_CONFLICT", "protected file differs from installed manifest", item["path"]) for item in result["differences"]])
             return result, 1
+        if "evaluationVersion" not in installed and os.path.lexists(Path(workspace) / EVALUATION_FILE):
+            result.update(status="conflict", reason="new-protected-path-conflict", nextAction="resolve-conflict",
+                          errors=[error("PACKAGE_BASELINE_CONFLICT", "fixed evaluation path already exists outside the installed package", EVALUATION_FILE)])
+            return result, 1
+        delivery = formal_delivery(workspace)
+        if delivery["errors"] and delivery["status"] != "legacy":
+            result.update(status="unsupported", reason="target-invalid", errors=delivery["errors"])
+            return result, 1
         with tempfile.TemporaryDirectory(prefix="agent-release-preflight-") as temp:
             package, release = _release_candidate(source, temp)
             incoming = release["manifest"]
@@ -1711,11 +1832,23 @@ def preflight_operation(workspace: str, source: str | None = None) -> tuple[dict
             source_match = incoming_source == CANONICAL_REPOSITORY and installed_source in (
                 CANONICAL_REPOSITORY, CANONICAL_REPOSITORY_URL, "personal-agent"
             )
+            if not source_match:
+                result.update(status="unsupported", reason="source-mismatch", nextAction="block",
+                              errors=[error("RELEASE_SOURCE_MISMATCH", "installed package source is not a recognized canonical source")])
+                return result, 1
             if release.get("bundle"):
                 incoming_hashes = {rel: sha256_bytes(data) for rel, data in
                                    _bundle_target_files(package, incoming, workspace, installed).items()}
             else:
-                incoming_hashes = incoming["files"]
+                incoming_hashes = {rel: incoming["files"][rel] for rel in incoming["protectedFiles"]}
+            if "evaluationVersion" in installed and "evaluationVersion" not in incoming:
+                raise PlanError("PACKAGE_INVALID", "canonical package would remove the default evaluation capability")
+            new_conflicts = [error("PACKAGE_BASELINE_CONFLICT", "new protected path already exists", rel)
+                             for rel in set(incoming_hashes) - set(installed["protectedFiles"])
+                             if os.path.lexists(Path(workspace) / rel)]
+            if new_conflicts:
+                result.update(status="conflict", reason="new-protected-path-conflict", nextAction="resolve-conflict", errors=new_conflicts)
+                return result, 1
             for rel in sorted(set(installed["protectedFiles"]) | set(incoming_hashes)):
                 old_hash = installed["files"].get(rel)
                 new_hash = incoming_hashes.get(rel)

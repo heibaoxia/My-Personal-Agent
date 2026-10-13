@@ -5,10 +5,10 @@ allowed-tools: Bash(python {baseDir}/tools/agent_scaffold.py:*)
 license: MIT
 metadata:
   author: personal-agent
-  version: "2.0.0"
+  version: "3.0.0"
   sourceRepository: heibaoxia/My-Personal-Agent
   sourcePath: .agents/skills/agent-scaffold-maintenance
-  toolVersion: "2.0.0"
+  toolVersion: "3.0.0"
 ---
 
 # Agent Scaffold Maintenance
@@ -18,7 +18,8 @@ calling Agent's requirements work to the deterministic CLI; it does not route
 or execute the domain Skills stored in a produced workspace.
 
 This directory is the complete installable architect Skill: `SKILL.md`,
-`tools/agent_scaffold.py`, `tools/validate_scaffold.py` and `tools/release.json`.
+`tools/agent_scaffold.py`, `tools/validate_scaffold.py`, `tools/agent_evaluation.py`,
+`tools/scaffold-evaluate.md` (the canonical evaluation Skill) and `tools/release.json`.
 Python 3.10 or newer and its standard library are sufficient for local work;
 Git is needed only for `git+` package sources. No development repository,
 OpenSpec installation, separate Agent Init script or Python package install
@@ -66,7 +67,7 @@ accepted YAML subset and reports unsupported fields.
   entry or placeholder capability is an intermediate result, not formal delivery.
 - `scaffold-description.md` has frontmatter `schemaVersion: 1`, integer
   `baselineVersion` starting at 1, `origin: confirmed` (or `reconstructed` for a
-  confirmed legacy reconstruction), `generatorVersion: "2.0.0"` and
+  confirmed legacy reconstruction), `generatorVersion: "3.0.0"` and
   `contentSha256` of the UTF-8 LF Markdown body after the closing frontmatter.
   Describe the assistant's goals, non-goals, capabilities, acceptance criteria,
   known gaps and rule-file pointers. Increment the baseline only for body changes.
@@ -75,20 +76,32 @@ accepted YAML subset and reports unsupported fields.
   `sourceRepository: "heibaoxia/My-Personal-Agent"`, `sourceCommit`,
   `assetName: "architect-bundle-<bundleVersion>.zip"`, `files` (relative path to
   raw-byte SHA-256), `protectedFiles` and `exclusions` arrays. `entrypoints` has
-  exactly `initialSkill`, `archiveSkill`, `architectSkill` (three distinct indexed
-  Skill IDs) and `architectCli` (the protected workspace-relative Python path).
+  exactly `initialSkill`, `archiveSkill`, `architectSkill`, `evaluationSkill`
+  (four distinct indexed Skill IDs) and `architectCli` (the protected
+  workspace-relative Python path). Set `evaluationVersion: "1"` and
+  `evaluationSkill: "scaffold-evaluate"`; its fixed path is
+  `.agent/skills/scaffold-evaluate.md`.
   `description` contains `path: "scaffold-description.md"`, its `baselineVersion`,
   `origin`, body `contentSha256` and boolean `redacted`. Include the entry,
   Description and declared rules in `files`; never list the manifest itself or
-  user Context data. Only the architect Skill and `.agent/architect/` runtime
+  user Context data, `scaffold-evaluation.md` or `scaffold-score-history.md`.
+  Only the architect/evaluation Skills and `.agent/architect/` runtime
   files belong to `protectedFiles`. The entry body discovers both the manifest
   and Description. Use the matching Release source commit when available;
   an explicit `unknown` marks an unverified local source.
 
 For new formal scaffolds, embed this Skill's body in an indexed architect
-Skill with the valid Skill frontmatter above. Copy the two Python modules and
+Skill with the valid Skill frontmatter above. Copy the three Python modules,
+`scaffold-evaluate.md` and
 `release.json` bytes into `.agent/architect/tools/` through the confirmed plan,
-and declare them and the architect Skill in `protectedFiles`. The embedded
+and declare them and both shared Skills in `protectedFiles`. Render
+`tools/scaffold-evaluate.md` using valid produced-Skill frontmatter with
+`id: scaffold-evaluate`, `sideEffects: writes-workspace`, `confirmation: required`,
+nonempty purpose/triggers/excludes/inputs/outputs/implementation and the unchanged
+canonical body. Replace `{baseDir}/tools` in that body with
+`.agent/architect/tools`, index its fixed path and explicitly locate
+`.agent/architect/tools/agent_evaluation.py`. Do not create either artifact before
+an actual evaluation or optimization. The embedded
 Skill must resolve its CLI at that workspace-relative path, verify the local
 release hashes, and execute the maintenance sequence. Replace each
 `{baseDir}/tools` command prefix in the embedded body with
@@ -163,12 +176,25 @@ limited to controlled rules, Description and manifest user-asset metadata.
 
 ## CLI discovery
 
+Determine whether this is the external installed Skill or the indexed embedded
+architect in the target scaffold before resolving the executable. For the
+embedded `.agent/skills/<architect-id>.md`, resolve `architectCli` from the
+target workspace's verified `.agent/scaffold-manifest.json`, then check its
+adjacent `release.json` version and hashes. A verified external handoff is the
+authorization to use this local runtime for the same request. The embedded
+architect proceeds to Required sequence and never recursively calls preflight
+or self-update. The external installed Skill uses the discovery rules below
+and completes Architect Release preflight before the Required sequence on an
+existing formal target. New workspace creation uses the verified external Skill
+directly; a missing or unrecognized target is not auto-upgraded.
+
 Resolve `{baseDir}` to the directory containing the `SKILL.md` that was
 actually selected for this conversation, then invoke only
 `{baseDir}/tools/agent_scaffold.py`. At the start of every maintenance task,
 record the resolved Skill root and CLI path, run `python {baseDir}/tools/agent_scaffold.py --version`,
-and require tool version `2.0.0` or newer. When `tools/release.json` exists,
-its version and SHA-256 entries must match the two CLI files before continuing.
+and require tool version `3.0.0` or newer. When `tools/release.json` exists,
+its version and SHA-256 entries must match all bundled tools and evaluation
+rule source before continuing.
 If multiple same-named installations are visible, use the selected verified
 Skill; conflicting versions or hashes block maintenance. Use the external CLI
 until a successful Release preflight hands off to the target architect.
@@ -195,8 +221,10 @@ fall back to a target-workspace CLI.
    migration must explicitly create `AGENTS.md` and delete `AGENT.md` in the
    same plan; the CLI never renames or deletes it on its own.
 2. **Review content before planning.** For manufacture or modification, read
-   the controlled entry, Context, Behavior, Skill, Workflow, and Integration
-   files. Check that the user's goal is covered, indexes and references agree,
+   the existing `scaffold-description.md` first as the confirmed goal baseline,
+   then the controlled entry, Context, Behavior, Skill, Workflow, and Integration
+   files. Conditionally inspect the latest evaluation as described below.
+   Check that the user's goal is covered, indexes and references agree,
     confirmation and side-effect boundaries are consistent, and existing rules
     outside the request remain protected. For archive behavior, require an
     explicit single authorization meaning (action-authorizes-write or
@@ -238,18 +266,96 @@ fall back to a target-workspace CLI.
    The preview is read-only. Ensure files outside the plan are absent from the
    change list and existing project files remain untouched.
 7. **Get explicit confirmation.** Show the user the files and actions in the
-   diff. Do not infer confirmation from a request to inspect, check, or preview.
+   diff and, for an actual optimization, the planned summary and result updates
+   to `scaffold-score-history.md`. Reuse this confirmation for those bounded
+   history writes; no separate confirmation or evaluation is required. Do not
+   infer confirmation from a request to inspect, check, or preview.
 8. **Apply once confirmed.** Run `apply --confirm` with the same plan. The CLI
    validates a temporary copy before writing, checks the baseline again, keeps
    a recoverable backup, and returns the backup identifier when successful.
+   For an optimization, save its `planned` history entry before calling apply;
+   follow the artifact sequence below. A failed plan record blocks rule writes.
 9. **Verify and recover.** Run `verify` after an apply. If apply or verification
    reports a failure, do not retry blindly; report the JSON error and use
    `restore --backup <id>` when the backup is available, then verify again.
+   Record the actual completed, failed or restored result in the same history
+   entry. History record failure does not undo or redefine the rule result.
+
+## Evaluation feedback and optimization history
+
+After the required Release preflight and any verified handoff, use the
+`agent_evaluation.py` adjacent to the selected verified maintenance CLI.
+It writes only the two fixed user artifacts, independently of rule plans.
+On each new maintenance task, inspect `scaffold-evaluation.md` conditionally:
+
+```text
+python {baseDir}/tools/agent_evaluation.py inspect <workspace>
+```
+
+`missing` allows normal maintenance and creates no placeholder. Read a
+`current` report's goal baseline, rule fingerprint, evidence scope and findings.
+Explicitly report `stale`, `invalid` or `unreadable`; an old score is not a
+current quality conclusion. An insufficient goal baseline remains a diagnosed
+gap, not a fabricated goal or fingerprint. Review suggestions against the
+Description and this request, keep only authorized candidates, and recheck
+their evidence. Low scores do not authorize extra work, force a new evaluation,
+or replace the Description. Do not add the optional report to `readBefore`.
+History is for human review and version association, not a score or planning
+gate. This artifact inspection cannot bypass a blocked preflight or handoff.
+
+For a confirmed optimization of existing assistant rules:
+
+1. Run `check` and `diff` first. Pure inspection, an unconfirmed plan, new
+   assistant creation, or a diff with no substantive rule changes does not
+   create a completed optimization version. Tool-package self-update preserves
+   the two artifacts and is not an assistant-quality optimization.
+2. Capture the current snapshot with the artifact tool. Choose a stable
+   `entryId` for this maintenance request and include the authorized problem
+   and change summaries in a plan-record input. Supply the snapshot as its
+   `baseline`; it checks rule and history bytes. Save the record with `plan
+   --input <outside-workspace>/optimization-plan.json --authorized`.
+   Do not begin apply unless the result confirms `historyWritten: true`.
+3. Apply the unchanged rule plan with the maintenance CLI, then verify. Follow
+   its recovery protocol on failure. These rule plans never include
+   `scaffold-evaluation.md` or `scaffold-score-history.md`; artifact authorization
+   does not expand the rule-path whitelist.
+4. Capture the resulting snapshot and pass it as the result-record baseline.
+   Use the same `entryId`, actual change and validation summaries, and the
+   truthful status `completed`, `failed`, `restored` or `no-change` with `result
+   --input <outside-workspace>/optimization-result.json --authorized`.
+   A restored attempt retains the prior active version; only a verified
+   substantive optimization becomes the active completed version. No score is
+   required, and multiple unscored versions are valid.
+5. If result recording fails, report the successful or failed rule result
+   separately from the pending history write. Preserve existing history,
+   retain the returned entry identifier, re-read current artifacts and rules,
+   and retry only that result record with a fresh checked snapshot. Never rerun
+   a successful rule apply merely to repair history or claim rollback occurred.
+
+```text
+python {baseDir}/tools/agent_evaluation.py snapshot <workspace>
+python {baseDir}/tools/agent_evaluation.py plan <workspace> --input <outside-workspace>/optimization-plan.json --authorized
+python {baseDir}/tools/agent_scaffold.py apply <workspace> --plan-file <outside-workspace>/plan.json --confirm --json
+python {baseDir}/tools/agent_scaffold.py verify <workspace> --json
+python {baseDir}/tools/agent_evaluation.py snapshot <workspace>
+python {baseDir}/tools/agent_evaluation.py result <workspace> --input <outside-workspace>/optimization-result.json --authorized
+```
+
+The plan-record JSON contains `entryId`, `plannedChanges`, `problems` and
+`baseline`; the result contains `entryId`, `status`, `actualChanges`,
+`validation` and `baseline`. All summary fields are string lists. Optional
+`recordedAt` has an explicit timezone; the tool supplies a timestamp if absent.
+Inputs live outside the target or are passed transiently through stdin. The
+tool emits structured JSON and never determines scores or performs rule
+changes. Ordinary domain conversations and Context archive never write these
+artifacts or create optimization entries.
 
 ## Architect Release preflight
 
-Use this sequence only when the request asks the built-in architect to maintain
-the scaffold. Ordinary domain conversations, Context archive actions and other
+Only the external installed maintenance Skill performs this sequence when
+delegating a maintenance request to an existing embedded architect. An embedded
+architect receiving a verified handoff skips this sequence and uses its local
+CLI; it does not re-check the remote Release. Ordinary domain conversations, Context archive actions and other
 Skills do not perform a network check or write the workspace.
 
 1. Run `preflight` before designing the maintenance plan:
@@ -393,7 +499,10 @@ workspace itself needs to be inspected or changed.
 Minimal Init creates only `AGENTS.md`. Formal delivery requires a valid
 Description, initial capability, archive Skill, protected architect Skill and
 self-contained CLI. The entry body points to `scaffold-description.md` and
-`.agent/scaffold-manifest.json`; its Skill index discovers all three roles.
+`.agent/scaffold-manifest.json`; its Skill index discovers all four roles,
+including the protected fixed `scaffold-evaluate` entry. Old four-entrypoint
+manifests without evaluation metadata are explicitly `legacy` delivery and
+require a controlled newer package upgrade before current formal acceptance.
 The manifest declares `schemaVersion: 1`, `packageVersion` (major.minor.patch),
 `bundleVersion` (the same value for new bundles), `contractVersion: "1"`,
 source, `sourceRepository`, `sourceCommit`, file SHA-256 hashes,
