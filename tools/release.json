@@ -1,14 +1,17 @@
 {
-  "assetName": "architect-bundle-2.0.0.zip",
-  "bundleVersion": "2.0.0",
+  "assetName": "architect-bundle-3.0.0.zip",
+  "bundleVersion": "3.0.0",
   "contractVersion": "1",
+  "evaluationVersion": "1",
   "files": {
-    "agent_scaffold.py": "404f6c561d59c02c0a4aab8ee6737627c1c32ca0200e09a5eb6968d811482136",
+    "agent_evaluation.py": "d98030d9001bd5d7270c613fe64e86def289c9bb564bb4ca52881d0a5431f563",
+    "agent_scaffold.py": "ca50e93103260a12d626f7d95d0081865421c2f5c0035669e231b93a03ca0f24",
+    "scaffold-evaluate.md": "167abbed7ff958c0d49b67e1638396df6753d081e30b5677b9b3d20d45bf1233",
     "validate_scaffold.py": "5d9484a0133003b644ceb142771c0e2c98d55a5d4c3c583b67301f3804a1efe9"
   },
   "schemaVersion": 1,
   "source": "tools/",
-  "sourceCommit": "0887d09f7e80091ffda20d60c3f11d53c85c6369",
+  "sourceCommit": "d1ee80fd388f56a1113c5487c255c0349f19b385",
   "sourceRepository": "heibaoxia/My-Personal-Agent",
-  "toolVersion": "2.0.0"
+  "toolVersion": "3.0.0"
 }
