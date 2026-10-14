@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 import tempfile
 
@@ -104,14 +105,47 @@ def _relative(value: object) -> str:
     return value
 
 
+def _output_dir(value: object) -> str:
+    if value is None or value == ".":
+        return "."
+    relative = _relative(value)
+    parts = relative.split("/")
+    if any(part.startswith(".") and part in (".", "..") for part in parts):
+        _fail("output directory must be a normalized relative path", "PATH_INVALID")
+    if any(re.search(r'[:<>"|?*\x00-\x1f]', part) or part.endswith((".", " "))
+           or re.fullmatch(r"(?i)(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?", part)
+           for part in parts):
+        _fail("output directory contains an unsafe path component", "PATH_INVALID")
+    return relative
+
+
+def _output_paths(root: Path, output_dir: object) -> dict[str, str]:
+    directory = _output_dir(output_dir)
+    names = {"report": REPORT_FILE, "history": HISTORY_FILE}
+    paths = {role: name if directory == "." else f"{directory}/{name}" for role, name in names.items()}
+    for relative in paths.values():
+        _path(root, relative, outcome=True)
+    return paths
+
+
 def _path(root: Path, relative: str, *, outcome: bool = False) -> Path:
     candidate = root / _relative(relative)
     try:
         candidate.resolve().relative_to(root)
     except (ValueError, OSError) as exc:
         raise EvaluationError("PATH_INVALID", "path escapes workspace", relative) from exc
-    if outcome and candidate.is_symlink():
-        raise EvaluationError("PATH_INVALID", "outcome may not be a symbolic link", relative)
+    if outcome:
+        current = root
+        for part in relative.split("/"):
+            current = current / part
+            try:
+                mode = current.lstat().st_mode
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise EvaluationError("PATH_INVALID", "outcome path cannot be checked", relative) from exc
+            if stat.S_ISLNK(mode):
+                raise EvaluationError("PATH_INVALID", "outcome path may not traverse a symbolic link", relative)
     if candidate.exists() and not candidate.is_file():
         raise EvaluationError("PATH_INVALID", "path must be a file", relative)
     return candidate
@@ -171,9 +205,11 @@ def _fingerprint(files: dict[str, str | None]) -> str | None:
     return digest(_json(files).encode("utf-8"))
 
 
-def capture_snapshot(workspace: str | Path) -> dict:
+def capture_snapshot(workspace: str | Path, output_dir: str | None = None) -> dict:
     """Capture evaluated user rules and outcome baselines without reading Context data."""
     root = _root(workspace)
+    directory = _output_dir(output_dir)
+    output_paths = _output_paths(root, directory)
     files = {}
     gaps = {}
     for relative in _rule_paths(root):
@@ -193,12 +229,12 @@ def capture_snapshot(workspace: str | Path) -> dict:
             files[relative] = None
             gaps[relative] = "unreadable"
     artifacts = {}
-    for name in OUTCOMES:
-        data = _bytes(root, name, outcome=True)
-        artifacts[name] = digest(data) if data is not None else None
+    for relative in output_paths.values():
+        data = _bytes(root, relative, outcome=True)
+        artifacts[relative] = digest(data) if data is not None else None
     return {"files": files, "ruleFingerprint": _fingerprint(files),
-            "descriptionSha256": files["scaffold-description.md"],
-            "artifacts": artifacts, "gaps": gaps}
+            "descriptionSha256": files["scaffold-description.md"], "outputDir": directory,
+            "outputPaths": output_paths, "artifacts": artifacts, "gaps": gaps}
 
 
 def _snapshot(value: object) -> dict:
@@ -220,24 +256,60 @@ def _snapshot(value: object) -> dict:
     if value.get("descriptionSha256") != files["scaffold-description.md"]:
         _fail("Description fingerprint does not match snapshot")
     artifacts = value.get("artifacts")
-    if not isinstance(artifacts, dict) or set(artifacts) != set(OUTCOMES):
+    if "outputDir" not in value and "outputPaths" not in value:
+        paths = {"report": REPORT_FILE, "history": HISTORY_FILE}
+        directory = "."
+        expected_artifacts = set(OUTCOMES)
+    else:
+        directory = _output_dir(value.get("outputDir"))
+        paths = value.get("outputPaths")
+        expected_paths = {role: name if directory == "." else f"{directory}/{name}"
+                          for role, name in (("report", REPORT_FILE), ("history", HISTORY_FILE))}
+        if paths != expected_paths:
+            _fail("snapshot output paths do not match its output directory", "PATH_INVALID")
+        expected_artifacts = set(expected_paths.values())
+    if not isinstance(artifacts, dict) or set(artifacts) != expected_artifacts:
         _fail("snapshot must include exactly both outcome baselines")
     for checksum in artifacts.values():
         _hash(checksum, "snapshot.artifacts")
+    if "outputDir" in value and value["outputDir"] != directory:
+        _fail("snapshot outputDir is not normalized", "PATH_INVALID")
     return value
 
 
 def _same_rules(left: dict, right: dict) -> bool:
-    return all(left.get(key) == right.get(key) for key in ("files", "ruleFingerprint", "descriptionSha256"))
+    left_dir = _output_dir(left.get("outputDir"))
+    right_dir = _output_dir(right.get("outputDir"))
+    left_paths = left.get("outputPaths") or {
+        "report": REPORT_FILE, "history": HISTORY_FILE}
+    right_paths = right.get("outputPaths") or {
+        "report": REPORT_FILE, "history": HISTORY_FILE}
+    return (all(left.get(key) == right.get(key) for key in
+                ("files", "ruleFingerprint", "descriptionSha256"))
+            and left_dir == right_dir and left_paths == right_paths)
+
+
+def _bind_output_dir(snapshot: dict, requested: str | None) -> tuple[str, dict[str, str]]:
+    directory = _output_dir(snapshot.get("outputDir"))
+    if requested is not None and _output_dir(requested) != directory:
+        raise EvaluationError("OUTPUT_DIR_MISMATCH",
+                              "operation output directory differs from the snapshot", requested)
+    paths = snapshot.get("outputPaths")
+    if paths is None:
+        paths = {"report": REPORT_FILE, "history": HISTORY_FILE}
+    return directory, paths
 
 
 def _check_baseline(root: Path, baseline: dict, *, rules: bool = True,
-                    outcomes: tuple[str, ...] = OUTCOMES) -> dict:
+                    outcomes: tuple[str, ...] | None = None) -> dict:
     _snapshot(baseline)
-    current = capture_snapshot(root)
+    directory = baseline.get("outputDir", ".")
+    current = capture_snapshot(root, directory)
     if rules and not _same_rules(baseline, current):
         _fail("evaluated rules changed; capture and evaluate again", "RULES_STALE")
-    for name in outcomes:
+    paths = baseline.get("outputPaths", {"report": REPORT_FILE, "history": HISTORY_FILE})
+    names = outcomes or tuple(paths.values())
+    for name in names:
         if baseline["artifacts"][name] != current["artifacts"][name]:
             raise EvaluationError("BASELINE_CHANGED", "outcome changed after capture", name)
     return current
@@ -359,18 +431,23 @@ def _block(text: str, marker: str) -> dict:
     return result
 
 
-def _read(root: Path, name: str) -> dict | None:
+def _read(root: Path, name: str, output_dir: str | None = None) -> dict | None:
+    paths = _output_paths(root, output_dir)
+    if name == REPORT_FILE:
+        name = paths["report"]
+    elif name == HISTORY_FILE:
+        name = paths["history"]
     raw = _bytes(root, name, outcome=True)
     if raw is None:
         return None
     try:
-        return _block(raw.decode("utf-8"), name[:-3])
+        return _block(raw.decode("utf-8"), Path(name).name[:-3])
     except UnicodeError as exc:
         raise EvaluationError("FORMAT_INVALID", "outcome is not UTF-8", name) from exc
 
 
-def read_report(workspace: str | Path) -> dict | None:
-    data = _read(_root(workspace), REPORT_FILE)
+def read_report(workspace: str | Path, output_dir: str | None = None) -> dict | None:
+    data = _read(_root(workspace), REPORT_FILE, output_dir)
     return normalize_report(data) if data is not None else None
 
 
@@ -438,17 +515,23 @@ def _history(data: object) -> dict:
     return data
 
 
-def read_history(workspace: str | Path) -> dict:
-    data = _read(_root(workspace), HISTORY_FILE)
+def read_history(workspace: str | Path, output_dir: str | None = None) -> dict:
+    data = _read(_root(workspace), HISTORY_FILE, output_dir)
     return _history(data) if data is not None else {"schemaVersion": SCHEMA_VERSION, "activeEntryId": None, "entries": []}
 
 
-def inspect_report(workspace: str | Path) -> dict:
+def inspect_report(workspace: str | Path, output_dir: str | None = None) -> dict:
     try:
-        report = read_report(workspace)
+        requested = _output_dir(output_dir)
+        report = read_report(workspace, requested)
         if report is None:
+            if requested != "." and (read_report(workspace) is not None
+                                     or read_history(workspace)["entries"]):
+                raise EvaluationError("OUTPUT_DIR_MISMATCH",
+                                      "existing outcomes use the workspace root directory", requested)
             return {"status": "missing"}
-        current = capture_snapshot(workspace)
+        _bind_output_dir(report["snapshot"], requested)
+        current = capture_snapshot(workspace, requested)
         return {"status": "current" if _same_rules(report["snapshot"], current) and report["specificationVersion"] == SPECIFICATION_VERSION else "stale",
                 "reportId": report["reportId"], "report": report}
     except EvaluationError as exc:
@@ -532,7 +615,8 @@ def _atomic_write(root: Path, name: str, content: str, expected: str | None, *, 
     path = _path(root, name, outcome=True)
     temporary = None
     try:
-        with tempfile.NamedTemporaryFile(mode="wb", prefix=f".{name}.", suffix=".tmp", dir=root, delete=False) as handle:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode="wb", prefix=f".{path.name}.", suffix=".tmp", dir=path.parent, delete=False) as handle:
             temporary = Path(handle.name)
             handle.write(content.encode("utf-8"))
             handle.flush()
@@ -540,7 +624,7 @@ def _atomic_write(root: Path, name: str, content: str, expected: str | None, *, 
         current = _bytes(root, name, outcome=True)
         if (digest(current) if current is not None else None) != expected:
             raise EvaluationError("BASELINE_CHANGED", "outcome changed before replacement", name)
-        if rules is not None and not _same_rules(rules, capture_snapshot(root)):
+        if rules is not None and not _same_rules(rules, capture_snapshot(root, rules.get("outputDir"))):
             _fail("rules changed before outcome replacement", "RULES_STALE")
         # ponytail: writers are serialized by the host; add an OS lock if concurrent writers are needed.
         os.replace(temporary, path)
@@ -585,7 +669,7 @@ def _associate(history: dict, report: dict) -> dict:
 
 
 def write_evaluation(workspace: str | Path, report: dict, *, authorized: bool,
-                     baseline: dict | None = None) -> dict:
+                     baseline: dict | None = None, output_dir: str | None = None) -> dict:
     if authorized is not True:
         return {"status": "cancelled", "reportWritten": False, "historyWritten": False}
     root = _root(workspace)
@@ -593,9 +677,10 @@ def write_evaluation(workspace: str | Path, report: dict, *, authorized: bool,
     if data["specificationVersion"] != SPECIFICATION_VERSION:
         _fail("use the current scoring specification for a new evaluation", "SPECIFICATION_STALE")
     captured = _snapshot(baseline or data["snapshot"])
-    old_report = read_report(root)
-    history = read_history(root)
-    current = capture_snapshot(root)
+    directory, paths = _bind_output_dir(captured, output_dir)
+    old_report = read_report(root, directory)
+    history = read_history(root, directory)
+    current = capture_snapshot(root, directory)
     if not _same_rules(data["snapshot"], current):
         _fail("evaluated rules changed; do not save a stale report", "RULES_STALE")
     retry = old_report is not None and old_report["reportId"] == data["reportId"]
@@ -612,7 +697,7 @@ def write_evaluation(workspace: str | Path, report: dict, *, authorized: bool,
             return {"status": "completed", "reportWritten": True, "historyWritten": True,
                     "reportId": data["reportId"], "entryId": saved["targetEntryId"], "idempotent": True}
         # A previous report-only write can be supplemented without rewriting it.
-        _check_baseline(root, captured, outcomes=(HISTORY_FILE,))
+        _check_baseline(root, captured, outcomes=(paths["history"],))
     else:
         _check_baseline(root, captured)
     if not history["entries"] and old_report is not None and not retry and _same_rules(old_report["snapshot"], current):
@@ -624,11 +709,13 @@ def write_evaluation(workspace: str | Path, report: dict, *, authorized: bool,
         data["targetEntryId"] = old_report["targetEntryId"] if old_report["snapshot"]["ruleFingerprint"] is not None and any(item["entryId"] == old_report["targetEntryId"] for item in history["entries"]) else None
     entry = _associate(history, data)
     if not retry:
-        _atomic_write(root, REPORT_FILE, render_report(data), current["artifacts"][REPORT_FILE], rules=data["snapshot"])
+        _atomic_write(root, paths["report"], render_report(data),
+                      current["artifacts"][paths["report"]], rules=data["snapshot"])
     result = {"status": "completed", "reportWritten": True, "historyWritten": False,
               "reportId": data["reportId"], "entryId": entry["entryId"]}
     try:
-        _atomic_write(root, HISTORY_FILE, render_history(history), current["artifacts"][HISTORY_FILE], rules=data["snapshot"])
+        _atomic_write(root, paths["history"], render_history(history),
+                      current["artifacts"][paths["history"]], rules=data["snapshot"])
         result["historyWritten"] = True
     except EvaluationError as exc:
         result.update(status="partial", error={"code": exc.code, "message": str(exc)})
@@ -637,32 +724,36 @@ def write_evaluation(workspace: str | Path, report: dict, *, authorized: bool,
 
 def plan_optimization(workspace: str | Path, entry_id: str, planned_changes: list[str],
                       problems: list[str], *, authorized: bool,
-                      baseline: dict | None = None, recorded_at: str | None = None) -> dict:
+                      baseline: dict | None = None, recorded_at: str | None = None,
+                      output_dir: str | None = None) -> dict:
     if authorized is not True:
         return {"status": "cancelled", "historyWritten": False}
     root = _root(workspace)
     _identifier(entry_id, "entryId")
     _strings(planned_changes, "plannedChanges", nonempty=True)
     _strings(problems, "problems")
-    captured = _snapshot(baseline or capture_snapshot(root))
-    history = read_history(root)
+    captured = _snapshot(baseline or capture_snapshot(root, output_dir))
+    directory, paths = _bind_output_dir(captured, output_dir)
+    history = read_history(root, directory)
     existing = next((item for item in history["entries"] if item["entryId"] == entry_id), None)
     if existing is not None:
         if existing["plannedChanges"] != planned_changes or existing["problems"] != problems or existing["baselineFingerprint"] != captured["ruleFingerprint"]:
             _fail("optimization ID already has a different plan", "ID_CONFLICT")
         return {"status": "completed", "historyWritten": True, "entryId": entry_id,
                 "optimizationStatus": existing["status"], "idempotent": True}
-    _check_baseline(root, captured)
+    current = _check_baseline(root, captured)
     entry = _entry(entry_id, "optimization", captured, _now(recorded_at))
     entry.update(status="planned", plannedChanges=copy.deepcopy(planned_changes), problems=copy.deepcopy(problems), ruleFingerprint=None)
     history["entries"].append(entry)
-    _atomic_write(root, HISTORY_FILE, render_history(history), captured["artifacts"][HISTORY_FILE], rules=captured)
+    _atomic_write(root, paths["history"], render_history(history),
+                  current["artifacts"][paths["history"]], rules=captured)
     return {"status": "completed", "historyWritten": True, "entryId": entry_id, "optimizationStatus": "planned"}
 
 
 def finish_optimization(workspace: str | Path, entry_id: str, status: str,
                         actual_changes: list[str], validation: list[str], *, authorized: bool,
-                        baseline: dict | None = None, recorded_at: str | None = None) -> dict:
+                        baseline: dict | None = None, recorded_at: str | None = None,
+                        output_dir: str | None = None) -> dict:
     if authorized is not True:
         return {"status": "cancelled", "historyWritten": False}
     root = _root(workspace)
@@ -671,8 +762,9 @@ def finish_optimization(workspace: str | Path, entry_id: str, status: str,
         _fail("result must be completed, failed, restored or no-change")
     _strings(actual_changes, "actualChanges", nonempty=status == "completed")
     _strings(validation, "validation", nonempty=True)
-    captured = _snapshot(baseline or capture_snapshot(root))
-    history = read_history(root)
+    captured = _snapshot(baseline or capture_snapshot(root, output_dir))
+    directory, paths = _bind_output_dir(captured, output_dir)
+    history = read_history(root, directory)
     entry = next((item for item in history["entries"] if item["entryId"] == entry_id), None)
     if entry is None or entry["kind"] != "optimization":
         _fail("save a confirmed optimization plan before applying rules", "PLAN_MISSING")
@@ -683,7 +775,7 @@ def finish_optimization(workspace: str | Path, entry_id: str, status: str,
             _fail("optimization result already recorded differently", "ID_CONFLICT")
         return {"status": "completed", "historyWritten": True, "entryId": entry_id,
                 "optimizationStatus": status, "idempotent": True}
-    _check_baseline(root, captured)
+    current = _check_baseline(root, captured)
     same = captured["ruleFingerprint"] == entry["baselineFingerprint"]
     if status == "completed" and (same or captured["ruleFingerprint"] is None):
         _fail("a completed optimization requires a verified substantive rule change", "NO_CHANGE")
@@ -695,7 +787,8 @@ def finish_optimization(workspace: str | Path, entry_id: str, status: str,
     entry.update(copy.deepcopy(result_fields), modifiedAt=_now(recorded_at))
     if status == "completed":
         history["activeEntryId"] = entry_id
-    _atomic_write(root, HISTORY_FILE, render_history(history), captured["artifacts"][HISTORY_FILE], rules=captured)
+    _atomic_write(root, paths["history"], render_history(history),
+                  current["artifacts"][paths["history"]], rules=captured)
     return {"status": "completed", "historyWritten": True, "entryId": entry_id, "optimizationStatus": status}
 
 
@@ -707,13 +800,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("command", choices=("snapshot", "inspect", "write", "plan", "result"))
     parser.add_argument("workspace")
     parser.add_argument("--input", help="ephemeral request JSON or - for stdin")
+    parser.add_argument("--output-dir", help="workspace-relative directory for the report and history")
     parser.add_argument("--authorized", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.command == "snapshot":
-            result = capture_snapshot(args.workspace)
+            result = capture_snapshot(args.workspace, args.output_dir)
         elif args.command == "inspect":
-            result = inspect_report(args.workspace)
+            result = inspect_report(args.workspace, args.output_dir)
         else:
             if not args.input:
                 _fail("write/plan/result requires --input")
@@ -729,13 +823,16 @@ def main(argv: list[str] | None = None) -> int:
             if not isinstance(payload, dict):
                 _fail("request JSON must be an object")
             if args.command == "write":
-                result = write_evaluation(args.workspace, payload, authorized=args.authorized)
+                result = write_evaluation(args.workspace, payload, authorized=args.authorized,
+                                          output_dir=args.output_dir or ".")
             elif args.command == "plan":
                 result = plan_optimization(args.workspace, payload.get("entryId"), payload.get("plannedChanges"), payload.get("problems"),
-                                           authorized=args.authorized, baseline=payload.get("baseline"), recorded_at=payload.get("recordedAt"))
+                                           authorized=args.authorized, baseline=payload.get("baseline"), recorded_at=payload.get("recordedAt"),
+                                           output_dir=args.output_dir or ".")
             else:
                 result = finish_optimization(args.workspace, payload.get("entryId"), payload.get("status"), payload.get("actualChanges"), payload.get("validation"),
-                                             authorized=args.authorized, baseline=payload.get("baseline"), recorded_at=payload.get("recordedAt"))
+                                             authorized=args.authorized, baseline=payload.get("baseline"), recorded_at=payload.get("recordedAt"),
+                                             output_dir=args.output_dir or ".")
         print(_json(result))
         return 1 if result.get("status") in ("partial", "invalid", "unreadable") else 0
     except (EvaluationError, OSError, UnicodeError, ValueError) as exc:

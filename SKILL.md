@@ -1,14 +1,16 @@
 ---
 name: agent-scaffold-maintenance
 description: Maintain an Agent workspace with the deterministic scaffold CLI. Use when a user asks to inspect, initialize, extend, update, validate, apply, or restore an Agent scaffold.
-allowed-tools: Bash(python {baseDir}/tools/agent_scaffold.py:*)
+allowed-tools:
+  - Bash(python {baseDir}/tools/agent_scaffold.py:*)
+  - Bash(python {baseDir}/tools/agent_asset_migration.py:*)
 license: MIT
 metadata:
   author: personal-agent
-  version: "3.0.0"
+  version: "3.1.0"
   sourceRepository: heibaoxia/My-Personal-Agent
   sourcePath: .agents/skills/agent-scaffold-maintenance
-  toolVersion: "3.0.0"
+  toolVersion: "3.1.0"
 ---
 
 # Agent Scaffold Maintenance
@@ -19,7 +21,8 @@ or execute the domain Skills stored in a produced workspace.
 
 This directory is the complete installable architect Skill: `SKILL.md`,
 `tools/agent_scaffold.py`, `tools/validate_scaffold.py`, `tools/agent_evaluation.py`,
-`tools/scaffold-evaluate.md` (the canonical evaluation Skill) and `tools/release.json`.
+`tools/agent_asset_migration.py`, `tools/scaffold-evaluate.md` (the canonical
+evaluation Skill) and `tools/release.json`.
 Python 3.10 or newer and its standard library are sufficient for local work;
 Git is needed only for `git+` package sources. No development repository,
 OpenSpec installation, separate Agent Init script or Python package install
@@ -67,7 +70,7 @@ accepted YAML subset and reports unsupported fields.
   entry or placeholder capability is an intermediate result, not formal delivery.
 - `scaffold-description.md` has frontmatter `schemaVersion: 1`, integer
   `baselineVersion` starting at 1, `origin: confirmed` (or `reconstructed` for a
-  confirmed legacy reconstruction), `generatorVersion: "3.0.0"` and
+  confirmed legacy reconstruction), `generatorVersion: "3.1.0"` and
   `contentSha256` of the UTF-8 LF Markdown body after the closing frontmatter.
   Describe the assistant's goals, non-goals, capabilities, acceptance criteria,
   known gaps and rule-file pointers. Increment the baseline only for body changes.
@@ -125,11 +128,22 @@ after the complete plan is applied.
   files are domain capabilities used during ordinary conversations. They are
   not this maintenance Skill, and ordinary domain work must not require the
   maintenance CLI.
-- `inspect` classifies a target as `missing`, `legacy`, `valid`, or `invalid`:
+- `inspect.classification` classifies a target as `missing`,
+  `existing-unmanaged`, `legacy`, `valid`, or `invalid`:
+  `existing-unmanaged` means user/project assets exist without a positive
+  scaffold contract marker. An ordinary Markdown `AGENTS.md` remains a
+  user-owned rule and is not an invalid generated entry.
   `legacy` means a recognized pre-`AGENTS.md` `AGENT.md` entry with its
   indexed `.agent/` objects present. An unrecognized `AGENT.md` or another
   host entry is reported as `WORKSPACE_ENTRY_UNSUPPORTED`; it is never
-  migrated automatically.
+  migrated automatically. `scaffold` is a compatibility alias that maps
+  `existing-unmanaged` to `missing`; branch on `classification`.
+  `adoptable` means the bounded read-only inventory can proceed to a
+  user-confirmed adoption discussion, not that writes are authorized.
+  `inventory.complete` must be true before preparing a complete adoption plan.
+- Physical project asset moves use the separate
+  `{baseDir}/tools/agent_asset_migration.py`. Never add project paths to the
+  ordinary scaffold plan or call the migration tool as part of rule maintenance.
 
 The CLI is deterministic and does not call an LLM, interpret Skill prose,
 route Skills, run Workflows, read Context state, call Integrations, or ask the
@@ -192,7 +206,7 @@ Resolve `{baseDir}` to the directory containing the `SKILL.md` that was
 actually selected for this conversation, then invoke only
 `{baseDir}/tools/agent_scaffold.py`. At the start of every maintenance task,
 record the resolved Skill root and CLI path, run `python {baseDir}/tools/agent_scaffold.py --version`,
-and require tool version `3.0.0` or newer. When `tools/release.json` exists,
+and require tool version `3.1.0` or newer. When `tools/release.json` exists,
 its version and SHA-256 entries must match all bundled tools and evaluation
 rule source before continuing.
 If multiple same-named installations are visible, use the selected verified
@@ -213,13 +227,18 @@ fall back to a target-workspace CLI.
 ## Required sequence
 
 1. **Inspect before designing.** Run `inspect` against the target workspace.
-   Read the JSON and retain its `workspace`, `scaffold`, `entry`, `objects`,
+   Read the JSON and retain its `workspace`, authoritative `classification`,
+   non-authorizing `adoptable`, `inventory.complete`, `entry`, `objects`,
    `files`, `errors`, and `warnings` fields. Do not write during inspection.
-   Choose the planning path from `scaffold`: manufacture a new workspace for
-   `missing`, migrate a recognized old entry for `legacy`, incrementally
-   modify a `valid` workspace, or repair an `invalid` workspace. A legacy
-   migration must explicitly create `AGENTS.md` and delete `AGENT.md` in the
-   same plan; the CLI never renames or deletes it on its own.
+   Branch on `classification`, never the compatibility `scaffold` alias.
+   `missing` may be manufactured; `legacy` requires an explicit migration;
+   `valid` supports incremental maintenance; `invalid` supports contract
+   repair. For `existing-unmanaged`, begin with a read-only adoption inventory
+   and do not prepare an applicable plan until the user has confirmed the
+   assistant goal and boundaries. If the inventory is incomplete or a needed
+   rule cannot be read safely, report the exact paths and stop planning.
+   A legacy migration must explicitly create `AGENTS.md` and delete
+   `AGENT.md` in the same plan; the CLI never renames or deletes it on its own.
 2. **Review content before planning.** For manufacture or modification, read
    the existing `scaffold-description.md` first as the confirmed goal baseline,
    then the controlled entry, Context, Behavior, Skill, Workflow, and Integration
@@ -233,10 +252,23 @@ fall back to a target-workspace CLI.
     Context categories or archive placeholders. This semantic review belongs to
     the calling Agent; the CLI only checks structure, paths, baselines, and
     static references.
-3. **Ask for missing information.** Turn missing purpose, identifiers, desired
-   Skills, side effects, confirmation policy, or prerequisites into concise
-   user questions. Resolve conflicts reported by `inspect` before generating a
-   plan.
+   During `existing-unmanaged` adoption, inventory existing root and
+   project-local `AGENTS.md` rules, project roots, relevant indexes, and
+   proposed Context source paths. A Context `sourceFiles` mapping is a
+   reference and access policy, not a data repository: do not copy its source
+   contents into new memory files. Description MUST NOT be inferred from
+   README, existing rules, filenames, evaluation history, or a missing
+   Description.
+3. **Resolve authority and missing information.** Applicable user and platform
+   instructions take priority. Root `AGENTS.md` rules govern cross-project
+   boundaries; project-local rules may refine them only within the root rules.
+   A Skill is an execution procedure subordinate to applicable AGENTS rules
+   and cannot override them. Preserve the complete original rule body of an
+   unmanaged `AGENTS.md`; if an entry change is needed, show the exact diff
+   while retaining every original rule. When root rules, project rules, or a
+   Skill conflict and the hierarchy cannot resolve it, identify both sources
+   and stop and ask the user. Also ask about missing purpose, identifiers,
+   desired Skills, side effects, confirmation policy, or prerequisites.
 4. **Generate a complete plan.** Include the target workspace, the current
    baseline for every planned read or write, and complete target contents for
    each file to add or modify. Include explicit deletes only when requested.
@@ -255,10 +287,21 @@ fall back to a target-workspace CLI.
    the body after closing frontmatter. Sync affected manifest user-file hashes
    and Description metadata in this same plan. One confirmation covers both
    rules and Description; do not ask for repeated requirements or a separate
-   Description confirmation. Create a Description with a null baseline and
-   `origin: confirmed`; reconstruct a missing old one with `origin: reconstructed`
-   and record unavailable intent before the same plan confirmation. Ordinary
-   conversations and archive cannot write Description.
+   Description confirmation. For a newly confirmed goal, create a Description
+   with a null baseline and `origin: confirmed`. Only for a previously managed
+   scaffold whose old Description is missing may an explicitly reviewed
+   reconstruction use `origin: reconstructed`; do not treat that as a
+   user-confirmed new goal. An `existing-unmanaged` formal adoption must use
+   `origin: confirmed`. Ordinary conversations and archive cannot write
+   Description.
+    For an `existing-unmanaged` adoption that changes assistant behavior, and
+    for any plan claiming formal delivery, the user must explicitly confirm
+    the Description's goals, non-goals, capabilities, and acceptance scope.
+    The same plan must include `AGENTS.md`, the confirmed Description, actual
+    indexed capabilities, `.agent/scaffold-manifest.json`, and current
+    baselines/content for every file declared by that manifest, including the
+    evaluation capability. A Description-only or partial bootstrap plan is not
+    a formal adoption; CLI `check` and `apply` reject it before any target write.
 5. **Check the plan.** Run `check` with the plan. A valid plan must pass path
    safety, baseline, and scaffold checks. If the target changed, regenerate the
    baseline instead of overriding it.
@@ -280,6 +323,39 @@ fall back to a target-workspace CLI.
    `restore --backup <id>` when the backup is available, then verify again.
    Record the actual completed, failed or restored result in the same history
    entry. History record failure does not undo or redefine the rule result.
+
+## Separate asset migration
+
+Only enter this workflow after the user explicitly selects each file, the
+migration root, source and target layout, and every relative link change.
+Review the exact external recovery-journal directory and recovery procedure
+shown by `diff` with the user before applying. Ordinary rule maintenance
+authorization does not authorize physical asset movement.
+
+The separate JSON plan declares `schemaVersion: 1`, the resolved workspace,
+workspace-relative `migrationRoot`, `sourceRoot`, `targetRoot`,
+`targetPolicy: fail`, and a complete `files` list. Each file record includes
+its source path, target path, and source SHA-256. `linkUpdates` records each
+existing link file's path and baseline SHA-256 plus its complete replacement
+content. Do not guess omitted assets or links. The CLI checks that the source
+tree is fully covered, target paths are clear, paths remain within the declared
+root, and the exact plan has a stable confirmation digest.
+
+```text
+python {baseDir}/tools/agent_asset_migration.py check <workspace> --plan-file <outside-workspace>/asset-plan.json
+python {baseDir}/tools/agent_asset_migration.py diff <workspace> --plan-file <outside-workspace>/asset-plan.json
+python {baseDir}/tools/agent_asset_migration.py apply <workspace> --plan-file <outside-workspace>/asset-plan.json --confirm <diff-confirmation-digest>
+python {baseDir}/tools/agent_asset_migration.py verify <workspace> --migration <migration-id>
+python {baseDir}/tools/agent_asset_migration.py restore <workspace> --migration <migration-id>
+```
+
+The user must confirm the exact digest printed by `diff`. Apply copies files
+and link updates first, verifies destination count and SHA-256, and only then
+removes sources. The external journal stores original bytes and recovery
+baselines. Restore removes only unchanged migration outputs, restores missing
+sources, and preserves concurrent user edits with path-specific conflicts.
+Missing backup data or a failed restore is reported; never guess or overwrite.
+The ordinary `agent_scaffold.py` `safe_rel` and `apply` scope remain unchanged.
 
 ## Evaluation feedback and optimization history
 
@@ -397,7 +473,21 @@ contains:
   "workspace": "<resolved target path>",
   "status": "ok",
   "errors": [],
-  "warnings": []
+  "warnings": [],
+  "classification": "existing-unmanaged",
+  "scaffold": "missing",
+  "adoptable": true,
+  "inventory": {
+    "complete": true,
+    "scannedEntries": 4,
+    "maxDepth": 12,
+    "maxEntries": 10000,
+    "skippedDirectories": [],
+    "excluded": [],
+    "warnings": [],
+    "files": ["AGENTS.md", "README.md"],
+    "objects": []
+  }
 }
 ```
 
@@ -408,10 +498,15 @@ text as a substitute for these fields.
 
 Operation-specific fields:
 
-- `inspect` also returns `scaffold`, `entry`, `objects`, and `files`; when an
-  `AGENT.md` exists it may include `legacyEntry`. `scaffold` is the workspace
-  classification (`missing`, `legacy`, `valid`, or `invalid`), while the
-  operation-level `status` still reports whether the CLI call itself succeeded.
+- `inspect` also returns authoritative `classification`, non-authorizing
+  `adoptable`, bounded `inventory`, compatibility `scaffold`, `entry`,
+  `objects`, and `files`; when an `AGENT.md` exists it may include
+  `legacyEntry`. The `inventory` skips common dependency/cache/build folders,
+  does not follow links, has fixed depth and entry limits, and never opens
+  dotenv files. `inventory.complete == false` blocks adoption planning.
+  `scaffold` maps `existing-unmanaged` to `missing`; branch on
+  `classification`. The operation-level `status` still reports whether the
+  CLI call itself succeeded.
 - `check` and `diff` also return `plan` and `changes`.
 - `apply` requires `--confirm`; it accepts `--plan-file PATH` or a plan on
   stdin and returns the applied result and backup information. Each `changes`
@@ -459,12 +554,16 @@ stdin. The CLI does not write a plan file into the target workspace.
 
 - `inspect.status == "error"`: show the concrete errors and ask for the
   missing or conflicting information; do not create files manually.
-- `inspect.scaffold == "legacy"`: prepare an explicit migration plan with an
+- `inspect.classification == "existing-unmanaged"`: inventory the existing
+  rules, projects, indexes, Context sources, and conflicts without writing.
+  Resolve unconfirmed goals and boundaries with the user before preparing a
+  complete formal plan.
+- `inspect.classification == "legacy"`: prepare an explicit migration plan with an
   `AGENTS.md` creation and `AGENT.md` deletion, then send it through `check`,
   `diff`, confirmation, `apply`, and `verify` like any other plan.
-- `inspect.scaffold == "missing"`: manufacture the smallest complete workspace
+- `inspect.classification == "missing"`: manufacture the smallest complete workspace
   that covers the user's request and preserve existing project files.
-- `inspect.scaffold == "valid"`: review the controlled content and generate a
+- `inspect.classification == "valid"`: review the controlled content and generate a
   minimal incremental plan; `invalid` uses the same protocol for repair.
 - `WORKSPACE_ENTRY_UNSUPPORTED` warnings identify an external entry. Preserve
   it and ask the calling Agent to decide whether a separately designed plan is

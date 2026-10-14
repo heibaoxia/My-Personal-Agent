@@ -30,13 +30,15 @@ import validate_scaffold
 
 
 SCHEMA_VERSION = 1
-TOOL_VERSION = "3.0.0"
+TOOL_VERSION = "3.1.0"
 MANIFEST_FILE = ".agent/scaffold-manifest.json"
 DESCRIPTION_FILE = validate_scaffold.DESCRIPTION_FILE
 ARCHITECT_ROOT = ".agent/architect/"
 EVALUATION_VERSION = "1"
 EVALUATION_SKILL = "scaffold-evaluate"
 EVALUATION_FILE = ".agent/skills/scaffold-evaluate.md"
+MIGRATION_VERSION = "1"
+MIGRATION_TOOL = "agent_asset_migration.py"
 CANONICAL_REPOSITORY = "heibaoxia/My-Personal-Agent"
 CANONICAL_REPOSITORY_URL = "https://github.com/" + CANONICAL_REPOSITORY
 CANONICAL_API_URL = "https://api.github.com/repos/%s/releases/latest" % CANONICAL_REPOSITORY
@@ -50,6 +52,16 @@ BACKUP_ID_RE = re.compile(r"^[0-9a-f-]{36}$")
 LEGACY_ENTRY = "AGENT.md"
 EXTERNAL_ENTRY_NAMES = ("CLAUDE.md", "GEMINI.md", "NANOBOT.md", "PI.md")
 BACKUP_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
+INVENTORY_MAX_DEPTH = 12
+INVENTORY_MAX_ENTRIES = 10000
+INVENTORY_RULE_MAX_BYTES = 256 * 1024
+INVENTORY_RULE_TOTAL_BYTES = 4 * 1024 * 1024
+INVENTORY_PRUNED_DIRECTORIES = frozenset({
+    ".git", ".hg", ".svn", ".venv", "venv", "env", "node_modules",
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox",
+    ".cache", "cache", "build", "dist", "target", "coverage", ".next",
+    ".turbo", "vendor",
+})
 
 
 class PlanError(Exception):
@@ -423,45 +435,234 @@ def legacy_entry(workspace: str) -> tuple[dict, list[dict]]:
     return entry, entry["indexes"]
 
 
+def is_windows_reserved_path(relative: str) -> bool:
+    return any(re.fullmatch(r"(?i)(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?", part)
+               for part in relative.split("/"))
+
+
+def _display_inventory_path(value: str) -> str:
+    return value.encode("utf-8", "replace").decode("utf-8")
+
+
+def inventory_workspace(workspace: str) -> dict:
+    """List bounded path metadata without following links or opening user files."""
+    files: list[str] = []
+    objects: list[str] = []
+    excluded: list[dict] = []
+    skipped: list[str] = []
+    warnings: list[dict] = []
+    rule_files: list[str] = []
+    complete = True
+    scanned = 0
+    rule_bytes = 0
+    stack = [("", workspace, 0)]
+    stopped = False
+
+    def diagnose(code: str, message: str, relative: str | None = None) -> None:
+        nonlocal complete
+        complete = False
+        try:
+            path = _display_inventory_path(relative) if relative else None
+        except (ValueError, UnicodeError):
+            path = "<unrepresentable>"
+        warnings.append(error(code, message, path))
+
+    while stack and not stopped:
+        parent_rel, parent_abs, depth = stack.pop()
+        if depth >= INVENTORY_MAX_DEPTH:
+            skipped.append(_display_inventory_path(parent_rel or "."))
+            diagnose("INVENTORY_DEPTH_LIMIT", "directory depth limit reached", parent_rel or ".")
+            continue
+        children = []
+        try:
+            with os.scandir(parent_abs) as entries:
+                for item in entries:
+                    if scanned >= INVENTORY_MAX_ENTRIES:
+                        diagnose("INVENTORY_ENTRY_LIMIT", "inventory entry limit reached", parent_rel or ".")
+                        stopped = True
+                        break
+                    scanned += 1
+                    children.append(item)
+        except PermissionError:
+            diagnose("INVENTORY_PERMISSION_DENIED", "directory cannot be enumerated", parent_rel or ".")
+            continue
+        except OSError as exc:
+            diagnose("INVENTORY_ENUMERATION_FAILED", exc.strerror or "directory cannot be enumerated",
+                     parent_rel or ".")
+            continue
+
+        children.sort(key=lambda item: (item.name.casefold(), item.name))
+        directories = []
+        for item in children:
+            relative = parent_rel or "."
+            try:
+                relative = (parent_rel + "/" if parent_rel else "") + item.name
+                relative = _display_inventory_path(relative.replace("\\", "/"))
+                if is_windows_reserved_path(relative):
+                    diagnose("INVENTORY_RESERVED_NAME", "path contains a Windows reserved name", relative)
+                    excluded.append({"path": relative, "reason": "windows-reserved-name"})
+                    continue
+                if item.is_symlink():
+                    diagnose("INVENTORY_SYMLINK_SKIPPED", "symbolic link was not followed", relative)
+                    excluded.append({"path": relative, "reason": "symbolic-link"})
+                    continue
+                if item.is_dir(follow_symlinks=False):
+                    if item.name.casefold() in INVENTORY_PRUNED_DIRECTORIES:
+                        skipped.append(relative)
+                    elif depth + 1 >= INVENTORY_MAX_DEPTH:
+                        skipped.append(relative)
+                        diagnose("INVENTORY_DEPTH_LIMIT", "directory depth limit reached", relative)
+                    else:
+                        directories.append((relative, item.path, depth + 1))
+                    continue
+                if not item.is_file(follow_symlinks=False):
+                    excluded.append({"path": relative, "reason": "special-file"})
+                    continue
+                files.append(relative)
+                if relative.startswith(".agent/"):
+                    objects.append(relative)
+                if item.name.casefold() == "agents.md":
+                    rule_files.append(relative)
+                    if rule_bytes + item.stat(follow_symlinks=False).st_size > INVENTORY_RULE_TOTAL_BYTES:
+                        diagnose("INVENTORY_RULE_BUDGET", "required rules exceed the inventory read budget", relative)
+                        continue
+                    with open(item.path, "rb") as handle:
+                        content = handle.read(INVENTORY_RULE_MAX_BYTES + 1)
+                    if len(content) > INVENTORY_RULE_MAX_BYTES:
+                        diagnose("INVENTORY_RULE_TOO_LARGE",
+                                 "required rule exceeds the per-file read limit", relative)
+                        continue
+                    rule_bytes += len(content)
+                if relative.casefold() == MANIFEST_FILE.casefold():
+                    size = item.stat(follow_symlinks=False).st_size
+                    if size > INVENTORY_RULE_MAX_BYTES:
+                        diagnose("INVENTORY_MANIFEST_TOO_LARGE",
+                                 "scaffold manifest exceeds the inventory metadata limit", relative)
+                if item.name.casefold() == ".env" or item.name.casefold().startswith(".env."):
+                    excluded.append({"path": relative, "reason": "dotenv"})
+            except PermissionError:
+                diagnose("INVENTORY_PERMISSION_DENIED", "path metadata cannot be read", relative)
+            except OSError as exc:
+                diagnose("INVENTORY_PATH_UNREADABLE", exc.strerror or "path metadata cannot be read", relative)
+            except (ValueError, UnicodeError) as exc:
+                diagnose("INVENTORY_PATH_INVALID", str(exc), relative)
+        stack.extend(reversed(directories))
+
+    return {
+        "complete": complete,
+        "scannedEntries": scanned,
+        "maxDepth": INVENTORY_MAX_DEPTH,
+        "maxEntries": INVENTORY_MAX_ENTRIES,
+        "skippedDirectories": sorted(skipped),
+        "excluded": sorted(excluded, key=lambda item: item["path"]),
+        "ruleFiles": sorted(rule_files),
+        "ruleBytesRead": rule_bytes,
+        "warnings": sorted(warnings, key=lambda item: (item.get("path") or "", item["code"])),
+        "files": sorted(files),
+        "objects": sorted(objects),
+    }
+
+
+def has_scaffold_contract_marker(workspace: str) -> tuple[bool, dict | None]:
+    """Recognize only a positive scaffold declaration, not arbitrary Markdown."""
+    manifest = os.path.join(workspace, MANIFEST_FILE.replace("/", os.sep))
+    if os.path.lexists(manifest):
+        return True, None
+    entry = os.path.join(workspace, "AGENTS.md")
+    if not os.path.lexists(entry):
+        return False, None
+    if os.path.islink(entry) or not os.path.isfile(entry):
+        return False, error("INSPECT_ENTRY_UNREADABLE", "AGENTS.md is not a readable regular file", "AGENTS.md")
+    try:
+        with open(entry, "rb") as handle:
+            raw = handle.read(256 * 1024)
+    except PermissionError:
+        return False, error("INSPECT_ENTRY_UNREADABLE", "AGENTS.md cannot be read", "AGENTS.md")
+    except OSError as exc:
+        return False, error("INSPECT_ENTRY_UNREADABLE", exc.strerror or "AGENTS.md cannot be read", "AGENTS.md")
+
+    marker = re.compile(rb"(?m)^contractVersion\s*:")
+    if not raw.startswith(b"---"):
+        return False, None
+    closer = re.search(rb"(?m)^---[ \t]*\r?$", raw[3:])
+    header = raw[3:closer.start() + 3] if closer else raw[3:]
+    return bool(marker.search(header)), None
+
+
 def inspect_workspace(workspace: str) -> dict:
-    if not os.path.exists(workspace):
-        return {"scaffold": "missing", "entry": {"path": "AGENTS.md", "exists": False, "canCreate": True},
+    if not os.path.lexists(workspace):
+        return {"classification": "missing", "scaffold": "missing", "adoptable": True,
+                "entry": {"path": "AGENTS.md", "exists": False, "canCreate": True},
                 "objects": [], "files": [], "errors": [],
+                "inventory": {"complete": True, "scannedEntries": 0, "maxDepth": INVENTORY_MAX_DEPTH,
+                              "maxEntries": INVENTORY_MAX_ENTRIES, "skippedDirectories": [],
+                              "excluded": [], "ruleFiles": [], "ruleBytesRead": 0, "warnings": []},
                 "warnings": [error("WORKSPACE_MISSING", "workspace does not exist; Agent entry can be created")]}
     if not os.path.isdir(workspace):
-        return {"scaffold": "invalid", "entry": {"path": "AGENTS.md", "exists": False, "canCreate": False},
-                "objects": [], "files": [], "errors": [error("WORKSPACE_NOT_DIRECTORY", "workspace is not a directory")], "warnings": []}
-    files = []
-    objects = []
-    for root, dirs, names in os.walk(workspace, followlinks=False):
-        dirs[:] = sorted(d for d in dirs if not os.path.islink(os.path.join(root, d)))
-        for name in sorted(names):
-            full = os.path.join(root, name)
-            rel = os.path.relpath(full, workspace).replace(os.sep, "/")
-            files.append(rel)
-            if rel.startswith(".agent/"):
-                objects.append(rel)
-    entry, declarations = inspect_entry(workspace)
+        return {"classification": "existing-unmanaged", "scaffold": "missing", "adoptable": False,
+                "entry": {"path": "AGENTS.md", "exists": False, "canCreate": False},
+                "objects": [], "files": [], "errors": [error("WORKSPACE_NOT_DIRECTORY", "workspace is not a directory")],
+                "inventory": {"complete": False, "scannedEntries": 0, "maxDepth": INVENTORY_MAX_DEPTH,
+                              "maxEntries": INVENTORY_MAX_ENTRIES, "skippedDirectories": [],
+                              "excluded": [], "ruleFiles": [], "ruleBytesRead": 0, "warnings": []}, "warnings": []}
+    inventory = inventory_workspace(workspace)
+    files = inventory["files"]
+    objects = inventory["objects"]
     entry_exists = os.path.lexists(os.path.join(workspace, "AGENTS.md"))
-    errors = [] if not entry_exists else validate_errors(validate_scaffold.validate(workspace))
-    warnings = []
-    legacy, legacy_declarations = legacy_entry(workspace) if not entry_exists else ({"path": LEGACY_ENTRY, "exists": False, "recognized": False}, [])
-    if not entry_exists:
+    entry = {"path": "AGENTS.md", "exists": entry_exists,
+             "canCreate": not entry_exists and not os.path.lexists(os.path.join(workspace, "AGENTS.md"))}
+    errors = []
+    warnings = list(inventory["warnings"])
+    marker, marker_error = has_scaffold_contract_marker(workspace)
+    if marker_error:
+        warnings.append(marker_error)
+    declarations = []
+    if marker:
+        if inventory["complete"] and marker_error is None:
+            entry, declarations = inspect_entry(workspace)
+            objects = sorted(set(objects) | {item["path"] for item in declarations})
+            try:
+                errors = validate_errors(validate_scaffold.validate(workspace))
+            except (OSError, UnicodeError, ValueError) as exc:
+                errors.append(error("INSPECT_VALIDATION_FAILED", str(exc), "AGENTS.md"))
+        else:
+            errors.append(error("INSPECT_VALIDATION_INCOMPLETE",
+                                "formal scaffold validation was not run because required inventory paths were incomplete"))
+    legacy, legacy_declarations = (legacy_entry(workspace)
+                                   if not entry_exists and not marker and inventory["complete"]
+                                   else ({"path": LEGACY_ENTRY, "exists": os.path.lexists(os.path.join(workspace, LEGACY_ENTRY)),
+                                          "recognized": False}, []))
+    if not entry_exists and not marker:
         if legacy["recognized"]:
             warnings.append(error("WORKSPACE_LEGACY_ENTRY", "AGENT.md is a legacy entry; create an explicit migration plan to AGENTS.md", LEGACY_ENTRY))
             declarations = legacy_declarations
+            objects = sorted(set(objects) | {item["path"] for item in declarations})
         else:
             warnings.append(error("WORKSPACE_ENTRY_MISSING", "AGENTS.md is absent; Agent entry can be created"))
-            if legacy["exists"]:
-                warnings.append(error("WORKSPACE_ENTRY_UNSUPPORTED", "AGENT.md is not a recognized legacy entry; do not migrate it automatically", LEGACY_ENTRY))
-        for name in EXTERNAL_ENTRY_NAMES:
-            if os.path.isfile(os.path.join(workspace, name)):
-                warnings.append(error("WORKSPACE_ENTRY_UNSUPPORTED", "%s is an external host entry; do not migrate it automatically" % name, name))
-    if not entry_exists and files:
+    if (not entry_exists or not marker) and files:
         warnings.append(error("WORKSPACE_EXISTING_FILES", "existing project files will be preserved unless a plan lists them"))
-    result = {"scaffold": "valid" if entry_exists and not errors else ("invalid" if entry_exists else ("legacy" if legacy["recognized"] else "missing")),
-              "entry": entry, "objects": declarations, "files": files, "errors": errors, "warnings": warnings}
-    result["delivery"] = formal_delivery(workspace)
+    if entry_exists and not marker:
+        warnings.append(error("WORKSPACE_UNMANAGED_ENTRY", "AGENTS.md is an existing user rule without a scaffold contract marker; preserve its contents", "AGENTS.md"))
+    if legacy["exists"] and not legacy["recognized"]:
+        warnings.append(error("WORKSPACE_ENTRY_UNSUPPORTED", "AGENT.md is not a recognized legacy entry; do not migrate it automatically", LEGACY_ENTRY))
+    for name in EXTERNAL_ENTRY_NAMES:
+        if os.path.lexists(os.path.join(workspace, name)):
+            warnings.append(error("WORKSPACE_ENTRY_UNSUPPORTED", "%s is an external host entry; do not migrate it automatically" % name, name))
+    if marker:
+        classification = "valid" if not errors else "invalid"
+    elif not entry_exists and legacy["recognized"]:
+        classification = "legacy"
+    elif files or entry_exists or marker_error:
+        classification = "existing-unmanaged"
+    else:
+        classification = "missing"
+    alias = "missing" if classification == "existing-unmanaged" else classification
+    adoptable = inventory["complete"] and classification != "invalid" and marker_error is None
+    result = {"classification": classification, "scaffold": alias, "adoptable": adoptable,
+              "entry": entry, "objects": declarations, "files": files, "errors": errors,
+              "warnings": warnings, "inventory": inventory}
+    if marker and inventory["complete"] and marker_error is None:
+        result["delivery"] = formal_delivery(workspace)
     if legacy["exists"]:
         result["legacyEntry"] = legacy
     return result
@@ -949,12 +1150,17 @@ def load_package_manifest(workspace: str, text: str | None = None) -> dict:
         points = manifest.get("entrypoints")
         roles = {"initialSkill", "archiveSkill", "architectSkill", "architectCli"}
         evaluation = "evaluationVersion" in manifest or (isinstance(points, dict) and "evaluationSkill" in points)
+        migration = "migrationVersion" in manifest
         if evaluation:
             roles.add("evaluationSkill")
             if manifest.get("evaluationVersion") != EVALUATION_VERSION or not isinstance(points, dict) or points.get("evaluationSkill") != EVALUATION_SKILL:
                 raise ValueError("evaluationVersion 1 and the fixed scaffold-evaluate entrypoint are required")
+        if migration:
+            roles.add("migrationTool")
         if not isinstance(points, dict) or set(points) != roles:
             raise ValueError("manifest needs initial/archive/architect entrypoints")
+        if migration and manifest["migrationVersion"] != MIGRATION_VERSION:
+            raise ValueError("unsupported migrationVersion")
         if any(not isinstance(points[key], str) or not validate_scaffold.SLUG_RE.fullmatch(points[key]) for key in ("initialSkill", "archiveSkill", "architectSkill")):
             raise ValueError("Skill entrypoints must be slugs")
         if len({points[key] for key in ("initialSkill", "archiveSkill", "architectSkill")}) != 3:
@@ -972,6 +1178,10 @@ def load_package_manifest(workspace: str, text: str | None = None) -> dict:
             rules = str(Path(points["architectCli"]).with_name("scaffold-evaluate.md")).replace("\\", "/")
             if not {EVALUATION_FILE, helper, rules}.issubset(protected):
                 raise ValueError("evaluation Skill, canonical rules and agent_evaluation.py must be protected")
+        if migration:
+            migration_tool = str(Path(points["architectCli"]).with_name(MIGRATION_TOOL)).replace("\\", "/")
+            if points["migrationTool"] != migration_tool or migration_tool not in protected:
+                raise ValueError("asset migration tool must be protected")
         if any(not rel.startswith(ARCHITECT_ROOT) and rel not in protected_skills for rel in protected):
             raise ValueError("protected Skills may only contain architect and evaluation entrypoints")
         if not {"AGENTS.md", DESCRIPTION_FILE}.issubset(files):
@@ -998,6 +1208,8 @@ def formal_delivery(workspace: str) -> dict:
                       manifestFormat=manifest.get("manifestFormat"),
                       evaluationVersion=manifest.get("evaluationVersion"),
                       evaluationStatus="available" if "evaluationVersion" in manifest else "legacy",
+                      migrationVersion=manifest.get("migrationVersion"),
+                      migrationStatus="available" if "migrationVersion" in manifest else "legacy",
                       manifest=MANIFEST_FILE, protectedFiles=manifest["protectedFiles"])
         report["files"] = manifest["files"]
         for rel, expected in manifest["files"].items():
@@ -1052,6 +1264,16 @@ def formal_delivery(workspace: str) -> dict:
                     errors.append(error("DELIVERY_EVALUATION_POLICY", "evaluation needs writes-workspace and required confirmation", evaluation))
                 if not data.get("implementation") or not validate_scaffold.description_body(text).strip() or helper not in text:
                     errors.append(error("DELIVERY_EVALUATION_TOOL_MISSING", "evaluation Skill must contain rules and locate protected agent_evaluation.py", evaluation))
+        if "migrationVersion" not in manifest:
+            errors.append(error("DELIVERY_MIGRATION_MISSING",
+                                "package lacks the protected asset migration tool", MIGRATION_TOOL))
+        else:
+            migration_tool = str(Path(cli).with_name(MIGRATION_TOOL)).replace("\\", "/")
+            if (manifest["entrypoints"].get("migrationTool") != migration_tool
+                    or migration_tool not in manifest["protectedFiles"]
+                    or migration_tool not in manifest["files"]):
+                errors.append(error("DELIVERY_MIGRATION_MISSING",
+                                    "asset migration tool must be packaged and protected", migration_tool))
         archive = skills.get(points["archiveSkill"])
         if archive:
             archive_text = (path_bytes(workspace, archive) or b"").decode("utf-8", "replace")
@@ -1072,8 +1294,10 @@ def formal_delivery(workspace: str) -> dict:
     for item in errors:
         collector.add(item)
     report["errors"] = validate_scaffold.sorted_errors(collector.items)
+    legacy_gaps = {"DELIVERY_EVALUATION_MISSING", "DELIVERY_MIGRATION_MISSING"}
     report["status"] = ("complete" if not report["errors"] else "legacy"
-                        if report.get("evaluationStatus") == "legacy" and all(item["code"] == "DELIVERY_EVALUATION_MISSING" for item in report["errors"])
+                        if (report.get("evaluationStatus") == "legacy" or report.get("migrationStatus") == "legacy")
+                        and all(item["code"] in legacy_gaps for item in report["errors"])
                         else "intermediate")
     return report
 
@@ -1082,6 +1306,7 @@ def check_maintenance_boundaries(workspace: str, plan: dict) -> None:
     old = load_package_manifest(workspace) if os.path.lexists(Path(workspace) / MANIFEST_FILE) else None
     new_text = plan["files"].get(MANIFEST_FILE)
     new = load_package_manifest(workspace, new_text) if isinstance(new_text, str) else old
+    check_adoption_completeness(workspace, plan, old, new)
     if old:
         for rel in old["protectedFiles"]:
             if rel in plan["files"] and current_hash(workspace, rel) != (None if plan["files"][rel] is None else sha256_bytes(plan["files"][rel].encode("utf-8"))):
@@ -1118,6 +1343,89 @@ def check_maintenance_boundaries(workspace: str, plan: dict) -> None:
                     raise PlanError("DESCRIPTION_NO_CHANGE", "retain original bytes when Description body is unchanged", DESCRIPTION_FILE)
             except (UnicodeError, ValueError, IndexError, KeyError, TypeError, validate_scaffold.YamlFail) as exc:
                 raise PlanError("DESCRIPTION_FIELD_INVALID", str(exc), DESCRIPTION_FILE) from exc
+
+
+def check_adoption_completeness(workspace: str, plan: dict,
+                                old_manifest: dict | None, new_manifest: dict | None) -> None:
+    if old_manifest is not None:
+        return
+    classification, inventory, marker_error = workspace_adoption_state(workspace)
+    formal_intent = (classification == "existing-unmanaged"
+                     or MANIFEST_FILE in plan["files"]
+                     or (classification == "missing" and DESCRIPTION_FILE in plan["files"]))
+    if not formal_intent:
+        return
+
+    required = ("AGENTS.md", DESCRIPTION_FILE, MANIFEST_FILE)
+    missing = [rel for rel in required
+               if rel not in plan["files"] or plan["files"][rel] is None]
+    if new_manifest is None:
+        missing.append("indexed initial/archive/architect/evaluation capabilities and migration tool")
+    else:
+        if "evaluationVersion" not in new_manifest:
+            missing.append("default scaffold-evaluate capability and tool")
+        if new_manifest.get("migrationVersion") != MIGRATION_VERSION:
+            missing.append("protected asset migration tool")
+        absent = sorted(rel for rel in new_manifest["files"]
+                        if rel not in plan["files"] or plan["files"][rel] is None)
+        missing.extend(absent)
+
+    if (classification in ("existing-unmanaged", "legacy", "formal")
+            and (not inventory["complete"] or marker_error is not None)):
+        raise PlanError("ADOPTION_INVENTORY_INCOMPLETE",
+                        "read-only inventory is incomplete; resolve its path diagnostics before adoption")
+    if DESCRIPTION_FILE in plan["files"] and isinstance(plan["files"][DESCRIPTION_FILE], str):
+        try:
+            metadata = validate_scaffold.description_metadata(plan["files"][DESCRIPTION_FILE])
+            if metadata.get("origin") != "confirmed":
+                missing.append("user-confirmed Description (origin: confirmed)")
+        except (ValueError, IndexError, KeyError, TypeError, validate_scaffold.YamlFail):
+            missing.append("valid user-confirmed Description")
+    if missing:
+        unique = list(dict.fromkeys(missing))
+        raise PlanError(
+            "ADOPTION_FORMAL_INCOMPLETE",
+            "formal adoption requires a confirmed Description, AGENTS.md entry, actual indexed capabilities, "
+            "evaluation capability, manifest, and baselines for every manifest file; missing: "
+            + ", ".join(unique),
+            MANIFEST_FILE,
+        )
+    if classification == "existing-unmanaged" and "AGENTS.md" in plan["files"]:
+        original = path_bytes(workspace, "AGENTS.md")
+        replacement = plan["files"]["AGENTS.md"]
+        if original is not None and isinstance(replacement, str):
+            try:
+                original_rules = original.decode("utf-8-sig")
+            except UnicodeError as exc:
+                raise PlanError("ADOPTION_RULES_UNREADABLE",
+                                "existing AGENTS.md is not valid UTF-8; preserve and resolve it before adoption",
+                                "AGENTS.md") from exc
+            original_rules = original_rules.replace("\r\n", "\n").replace("\r", "\n")
+            replacement = replacement.replace("\r\n", "\n").replace("\r", "\n")
+            if original_rules and original_rules not in replacement:
+                raise PlanError("ADOPTION_RULES_NOT_PRESERVED",
+                                "formal adoption must preserve the complete original AGENTS.md body verbatim",
+                                "AGENTS.md")
+
+
+def workspace_adoption_state(workspace: str) -> tuple[str, dict, dict | None]:
+    if not os.path.lexists(workspace):
+        return "missing", {"complete": True}, None
+    if not os.path.isdir(workspace):
+        return "existing-unmanaged", {"complete": False}, error(
+            "WORKSPACE_NOT_DIRECTORY", "workspace is not a directory")
+    inventory = inventory_workspace(workspace)
+    marker, marker_error = has_scaffold_contract_marker(workspace)
+    if marker:
+        return "formal", inventory, marker_error
+    if os.path.lexists(os.path.join(workspace, "AGENTS.md")):
+        return "existing-unmanaged", inventory, marker_error
+    legacy_path = os.path.join(workspace, LEGACY_ENTRY)
+    if os.path.lexists(legacy_path):
+        legacy, _ = legacy_entry(workspace)
+        if legacy["recognized"]:
+            return "legacy", inventory, marker_error
+    return ("existing-unmanaged" if inventory["files"] else "missing"), inventory, marker_error
 
 
 def render_description(body: str, baseline_version: int = 1, origin: str = "confirmed") -> str:
@@ -1267,6 +1575,8 @@ def package_operation(operation: str, workspace: str, source: str | None, confir
                               manifest="architect-bundle-manifest.json",
                               evaluationVersion=bundle_manifest.get("evaluationVersion"),
                               evaluationStatus="available" if "evaluationVersion" in bundle_manifest else "legacy",
+                              migrationVersion=bundle_manifest.get("migrationVersion"),
+                              migrationStatus="available" if "migrationVersion" in bundle_manifest else "legacy",
                               files=bundle_manifest["files"],
                               protectedFiles=bundle_manifest["protectedFiles"])
                 return result, 0
@@ -1327,6 +1637,11 @@ def package_operation(operation: str, workspace: str, source: str | None, confir
                         installed["files"]["AGENTS.md"] = sha256_bytes(entry)
                 elif "evaluationVersion" in installed:
                     raise PlanError("PACKAGE_EVALUATION_DOWNGRADE", "upgrade cannot remove the default evaluation capability")
+                if "migrationVersion" in incoming:
+                    installed["migrationVersion"] = incoming["migrationVersion"]
+                    installed["entrypoints"]["migrationTool"] = incoming["entrypoints"]["migrationTool"]
+                elif "migrationVersion" in installed:
+                    raise PlanError("PACKAGE_MIGRATION_DOWNGRADE", "upgrade cannot remove the asset migration tool")
                 installed["packageVersion"] = incoming["packageVersion"]
                 installed["source"] = incoming["source"]
                 if "bundleVersion" in incoming:
@@ -1529,6 +1844,10 @@ def _read_architect_bundle_manifest(root: str) -> dict:
         if manifest["evaluationVersion"] != EVALUATION_VERSION:
             raise _release_error("PACKAGE_INVALID", "unsupported evaluationVersion", str(path))
         roles.update(("evaluationSkill", "evaluationTool"))
+    if "migrationVersion" in manifest:
+        if manifest["migrationVersion"] != MIGRATION_VERSION:
+            raise _release_error("PACKAGE_INVALID", "unsupported migrationVersion", str(path))
+        roles.add("migrationTool")
     if (not isinstance(points, dict) or set(points) != roles
             or any(not isinstance(points[key], str) or points[key] not in files for key in points)):
         raise _release_error("PACKAGE_INVALID", "architect bundle entrypoints are incomplete", str(path))
@@ -1537,6 +1856,10 @@ def _read_architect_bundle_manifest(root: str) -> dict:
         rules = str(Path(points["cli"]).with_name("scaffold-evaluate.md")).replace("\\", "/")
         if points["evaluationSkill"] != EVALUATION_FILE or points["evaluationTool"] != helper or rules not in files:
             raise _release_error("PACKAGE_INVALID", "evaluation bundle paths or canonical rules are incomplete", str(path))
+    if "migrationVersion" in manifest:
+        migration_tool = str(Path(points["cli"]).with_name(MIGRATION_TOOL)).replace("\\", "/")
+        if points["migrationTool"] != migration_tool:
+            raise _release_error("PACKAGE_INVALID", "asset migration bundle path is invalid", str(path))
     for rel, expected in files.items():
         try:
             safe_rel(rel)
@@ -1703,6 +2026,9 @@ def _bundle_target_files(bundle: str, bundle_manifest: dict, workspace: str, ins
             raise PlanError("PACKAGE_INVALID", "evaluation bundle lacks its canonical rule source", source_rules)
         target_rules = str(Path(target_cli_rel).with_name("scaffold-evaluate.md")).replace("\\", "/")
         mapped[target_rules] = path_bytes(bundle, source_rules)
+    if "migrationVersion" in bundle_manifest:
+        migration_tool = str(Path(target_cli_rel).with_name(MIGRATION_TOOL)).replace("\\", "/")
+        mapped[migration_tool] = _bundle_file(bundle, bundle_manifest, "migrationTool")
     return mapped
 
 
@@ -1767,6 +2093,13 @@ def _materialize_bundle_for_target(bundle: str, bundle_manifest: dict, workspace
         entry = _entry_with_evaluation(workspace)
         (stage / "AGENTS.md").write_bytes(entry)
         synthetic["files"]["AGENTS.md"] = sha256_bytes(entry)
+    if "migrationVersion" in bundle_manifest:
+        synthetic["migrationVersion"] = bundle_manifest["migrationVersion"]
+        synthetic["entrypoints"] = {
+            **synthetic["entrypoints"],
+            "migrationTool": str(Path(synthetic["entrypoints"]["architectCli"])
+                                 .with_name(MIGRATION_TOOL)).replace("\\", "/"),
+        }
     (stage / MANIFEST_FILE).parent.mkdir(parents=True, exist_ok=True)
     (stage / MANIFEST_FILE).write_text(json.dumps(synthetic, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8", newline="\n")
     return str(stage)
@@ -1800,6 +2133,11 @@ def preflight_operation(workspace: str, source: str | None = None) -> tuple[dict
         if "evaluationVersion" not in installed and os.path.lexists(Path(workspace) / EVALUATION_FILE):
             result.update(status="conflict", reason="new-protected-path-conflict", nextAction="resolve-conflict",
                           errors=[error("PACKAGE_BASELINE_CONFLICT", "fixed evaluation path already exists outside the installed package", EVALUATION_FILE)])
+            return result, 1
+        installed_migration_tool = str(Path(installed["entrypoints"]["architectCli"]).with_name(MIGRATION_TOOL)).replace("\\", "/")
+        if "migrationVersion" not in installed and os.path.lexists(Path(workspace) / installed_migration_tool):
+            result.update(status="conflict", reason="new-protected-path-conflict", nextAction="resolve-conflict",
+                          errors=[error("PACKAGE_BASELINE_CONFLICT", "asset migration tool path already exists outside the installed package", installed_migration_tool)])
             return result, 1
         delivery = formal_delivery(workspace)
         if delivery["errors"] and delivery["status"] != "legacy":
@@ -1843,6 +2181,8 @@ def preflight_operation(workspace: str, source: str | None = None) -> tuple[dict
                 incoming_hashes = {rel: incoming["files"][rel] for rel in incoming["protectedFiles"]}
             if "evaluationVersion" in installed and "evaluationVersion" not in incoming:
                 raise PlanError("PACKAGE_INVALID", "canonical package would remove the default evaluation capability")
+            if "migrationVersion" in installed and "migrationVersion" not in incoming:
+                raise PlanError("PACKAGE_INVALID", "canonical package would remove the asset migration tool")
             new_conflicts = [error("PACKAGE_BASELINE_CONFLICT", "new protected path already exists", rel)
                              for rel in set(incoming_hashes) - set(installed["protectedFiles"])
                              if os.path.lexists(Path(workspace) / rel)]

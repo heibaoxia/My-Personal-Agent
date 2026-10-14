@@ -32,6 +32,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 
 # ---------------------------------------------------------------- constants --
@@ -59,6 +60,7 @@ STR, BOOL, SLUG, STR_LIST, STEP_LIST, OBJECT_INDEX = (
     "string", "boolean", "slug", "string-list", "step-list", "object-index",
 )
 REQUIREMENTS_LIST = "requirements-list"
+SOURCE_FILES = "context-source-files"
 
 # Frontmatter is the machine truth for the index; unknown keys are reported.
 ENTRY_SCHEMA = {
@@ -119,6 +121,7 @@ OPTIONAL_OBJECT_FIELDS = {
 CONTEXT_SCHEMA = {
     "categories": (STR_LIST, None, None),
     "sources": (STR_LIST, None, None),
+    "sourceFiles": (SOURCE_FILES, None, None),
     "states": (STR_LIST, None, None),
     "writePolicy": (STR, None, None),
     "retention": (STR, None, None),
@@ -865,12 +868,109 @@ class Validator:
         if not value:
             self.col.fail("SCAFFOLD_FIELD_EMPTY", rel, line, "field '%s' must not be empty" % name)
             return
+        if kind == SOURCE_FILES:
+            self.check_context_source_files(rel, value, line)
+            return
         if kind == REQUIREMENTS_LIST:
             return  # entries are checked with source-line context in check_requires()
         if kind == OBJECT_INDEX:
             return  # index entries are checked item-by-item in check_entry_index()
         for item in value:
             self.check_scalar(rel, "%s entry" % name, item, line, element or STR, None)
+
+    def check_context_source_files(self, rel, entries, line):
+        required = {"id", "path", "purpose", "readPolicy", "writePolicy"}
+        seen_ids = set()
+        seen_paths = set()
+        for index, entry in enumerate(entries, 1):
+            prefix = "sourceFiles entry %d" % index
+            if not isinstance(entry, dict):
+                self.col.fail("SCAFFOLD_CONTEXT_SOURCE_TYPE", rel, line,
+                              "%s must be a mapping" % prefix)
+                continue
+            for field in sorted(required - entry.keys()):
+                self.col.fail("SCAFFOLD_CONTEXT_SOURCE_FIELD_MISSING", rel, line,
+                              "%s is missing '%s'" % (prefix, field))
+            for field in sorted(entry.keys() - required):
+                self.col.fail("SCAFFOLD_CONTEXT_SOURCE_FIELD_UNKNOWN", rel, line,
+                              "%s contains unknown field '%s'" % (prefix, field))
+
+            ident = entry.get("id")
+            if not isinstance(ident, str) or not SLUG_RE.fullmatch(ident):
+                self.col.fail("SCAFFOLD_CONTEXT_SOURCE_ID", rel, line,
+                              "%s id must be a stable lowercase slug" % prefix)
+            elif ident in seen_ids:
+                self.col.fail("SCAFFOLD_CONTEXT_SOURCE_DUPLICATE", rel, line,
+                              "%s duplicates id '%s'" % (prefix, ident))
+            else:
+                seen_ids.add(ident)
+
+            purpose = entry.get("purpose")
+            if not isinstance(purpose, str) or not purpose.strip():
+                self.col.fail("SCAFFOLD_CONTEXT_SOURCE_PURPOSE", rel, line,
+                              "%s purpose must be a nonempty string" % prefix)
+            if entry.get("readPolicy") != "on-demand":
+                self.col.fail("SCAFFOLD_CONTEXT_SOURCE_READ_POLICY", rel, line,
+                              "%s readPolicy must be 'on-demand'" % prefix)
+            if entry.get("writePolicy") not in ("read-only", "confirm"):
+                self.col.fail("SCAFFOLD_CONTEXT_SOURCE_WRITE_POLICY", rel, line,
+                              "%s writePolicy must be 'read-only' or 'confirm'" % prefix)
+
+            path = entry.get("path")
+            if not isinstance(path, str) or not path.strip():
+                self.col.fail("SCAFFOLD_CONTEXT_SOURCE_PATH", rel, line,
+                              "%s path must be a nonempty workspace-relative file path" % prefix)
+                continue
+            if (path.startswith(("/", "\\", "~")) or re.match(r"^[A-Za-z]:", path)
+                    or "\\" in path or any(part in ("", ".", "..") for part in path.split("/"))
+                    or any(character in path for character in "*?[]")
+                    or any(re.search(r'[:<>"|*\x00-\x1f]', part) or part.endswith((".", " "))
+                           or re.fullmatch(r"(?i)(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?", part)
+                           for part in path.split("/"))):
+                self.col.fail("SCAFFOLD_CONTEXT_SOURCE_PATH", rel, line,
+                              "%s path '%s' must be a safe normalized workspace-relative path without wildcards"
+                              % (prefix, path))
+                continue
+            folded = path.casefold()
+            if folded in seen_paths:
+                self.col.fail("SCAFFOLD_CONTEXT_SOURCE_DUPLICATE", rel, line,
+                              "%s duplicates path '%s'" % (prefix, path))
+            seen_paths.add(folded)
+            self.check_context_source_target(rel, path, line, prefix)
+
+    def check_context_source_target(self, rel, path, line, prefix):
+        candidate = os.path.abspath(os.path.join(self.root, *path.split("/")))
+        if not is_within(candidate, os.path.abspath(self.root)):
+            self.col.fail("SCAFFOLD_CONTEXT_SOURCE_PATH", rel, line,
+                          "%s path '%s' escapes the workspace" % (prefix, path))
+            return
+        current = os.path.abspath(self.root)
+        parts = path.split("/")
+        for index, part in enumerate(parts):
+            current = os.path.join(current, part)
+            try:
+                mode = os.lstat(current).st_mode
+            except FileNotFoundError:
+                self.col.fail("SCAFFOLD_CONTEXT_SOURCE_MISSING", rel, line,
+                              "%s source '%s' does not exist" % (prefix, path))
+                return
+            except OSError as exc:
+                self.col.fail("SCAFFOLD_CONTEXT_SOURCE_UNREADABLE", rel, line,
+                              "%s source '%s' metadata cannot be checked: %s"
+                              % (prefix, path, exc.strerror or exc))
+                return
+            if stat.S_ISLNK(mode):
+                self.col.fail("SCAFFOLD_CONTEXT_SOURCE_SYMLINK", rel, line,
+                              "%s source '%s' must not traverse a symbolic link" % (prefix, path))
+                return
+            if index < len(parts) - 1 and not stat.S_ISDIR(mode):
+                self.col.fail("SCAFFOLD_CONTEXT_SOURCE_NOT_FILE", rel, line,
+                              "%s source parent in '%s' is not a directory" % (prefix, path))
+                return
+            if index == len(parts) - 1 and not stat.S_ISREG(mode):
+                self.col.fail("SCAFFOLD_CONTEXT_SOURCE_NOT_FILE", rel, line,
+                              "%s source '%s' is not a regular file" % (prefix, path))
+                return
 
     def check_scalar(self, rel, name, value, line, kind, allowed):
         if kind == BOOL:
