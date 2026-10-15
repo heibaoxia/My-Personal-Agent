@@ -144,6 +144,12 @@ report["dimensions"]["goal-coverage"] = {
 评分正文与成果工具位于 `{baseDir}/tools/`；原生脚手架使用已登记的
 `.agent/architect/tools/agent_evaluation.py`。不依赖生产者机器绝对路径。
 
+命令中的 `python` 表示已验证的 Python 3.10+ 解释器。首次独立评分时，
+Windows 依次尝试 `python`、`py -3`，macOS 依次尝试 `python3`、`python`；
+检查真实版本后在本次流程复用同一解释器，维护交接时沿用已选解释器。
+候选都不可用时由宿主报告 `cli-unavailable`，保留尝试命令、路径和错误且不写成果。
+优先用参数数组调用；使用终端时按 PowerShell 或 Zsh/Bash 的语法引用含空格路径。
+
 ```text
 python {baseDir}/tools/agent_evaluation.py snapshot <workspace>
 python {baseDir}/tools/agent_evaluation.py inspect <workspace>

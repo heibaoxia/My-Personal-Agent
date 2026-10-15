@@ -3,14 +3,24 @@ name: agent-scaffold-maintenance
 description: Maintain an Agent workspace with the deterministic scaffold CLI. Use when a user asks to inspect, initialize, extend, update, validate, apply, or restore an Agent scaffold.
 allowed-tools:
   - Bash(python {baseDir}/tools/agent_scaffold.py:*)
+  - Bash(python3 {baseDir}/tools/agent_scaffold.py:*)
+  - Bash(py -3 {baseDir}/tools/agent_scaffold.py:*)
   - Bash(python {baseDir}/tools/agent_asset_migration.py:*)
+  - Bash(python3 {baseDir}/tools/agent_asset_migration.py:*)
+  - Bash(py -3 {baseDir}/tools/agent_asset_migration.py:*)
+  - Bash(python {baseDir}/tools/agent_evaluation.py:*)
+  - Bash(python3 {baseDir}/tools/agent_evaluation.py:*)
+  - Bash(py -3 {baseDir}/tools/agent_evaluation.py:*)
+  - Bash(python {baseDir}/tools/validate_scaffold.py:*)
+  - Bash(python3 {baseDir}/tools/validate_scaffold.py:*)
+  - Bash(py -3 {baseDir}/tools/validate_scaffold.py:*)
 license: MIT
 metadata:
   author: personal-agent
-  version: "3.1.0"
+  version: "3.2.0"
   sourceRepository: heibaoxia/My-Personal-Agent
   sourcePath: .agents/skills/agent-scaffold-maintenance
-  toolVersion: "3.1.0"
+  toolVersion: "3.2.0"
 ---
 
 # Agent Scaffold Maintenance
@@ -54,6 +64,11 @@ accepted YAML subset and reports unsupported fields.
   only `degrade` includes a nonempty `note`. Optional nonempty `readBefore`
   lists existing safe workspace-relative files. Optional `workflow` or
   `workflows` references indexed Workflows.
+- Keep the same entry, indexes, relative paths and core Python source on Windows
+  and macOS. Declare platform-specific tools or permissions in `implementation`
+  or the existing `requires`/Integration fields, with an explicit missing policy.
+  Do not invent `platforms` fields, duplicate Skills, platform directories or
+  launchers merely because Python has a different command name.
 - Workflow frontmatter requires `id`, `purpose` and at least two `steps`.
   Optional `usesSkills` references indexed Skills; `inputs` and `outputs` are
   string lists. Integration frontmatter requires `id`, `kind` (`mcp`, `cli` or
@@ -70,7 +85,7 @@ accepted YAML subset and reports unsupported fields.
   entry or placeholder capability is an intermediate result, not formal delivery.
 - `scaffold-description.md` has frontmatter `schemaVersion: 1`, integer
   `baselineVersion` starting at 1, `origin: confirmed` (or `reconstructed` for a
-  confirmed legacy reconstruction), `generatorVersion: "3.1.0"` and
+  confirmed legacy reconstruction), `generatorVersion: "3.2.0"` and
   `contentSha256` of the UTF-8 LF Markdown body after the closing frontmatter.
   Describe the assistant's goals, non-goals, capabilities, acceptance criteria,
   known gaps and rule-file pointers. Increment the baseline only for body changes.
@@ -94,7 +109,7 @@ accepted YAML subset and reports unsupported fields.
   an explicit `unknown` marks an unverified local source.
 
 For new formal scaffolds, embed this Skill's body in an indexed architect
-Skill with the valid Skill frontmatter above. Copy the three Python modules,
+Skill with the valid Skill frontmatter above. Copy the four Python modules,
 `scaffold-evaluate.md` and
 `release.json` bytes into `.agent/architect/tools/` through the confirmed plan,
 and declare them and both shared Skills in `protectedFiles`. Render
@@ -204,11 +219,29 @@ directly; a missing or unrecognized target is not auto-upgraded.
 
 Resolve `{baseDir}` to the directory containing the `SKILL.md` that was
 actually selected for this conversation, then invoke only
-`{baseDir}/tools/agent_scaffold.py`. At the start of every maintenance task,
-record the resolved Skill root and CLI path, run `python {baseDir}/tools/agent_scaffold.py --version`,
-and require tool version `3.1.0` or newer. When `tools/release.json` exists,
+`{baseDir}/tools/agent_scaffold.py`. Before the first CLI call, try the
+platform-appropriate Python 3.10+ command candidates: Windows uses `python`
+then `py -3`; macOS uses `python3` then `python`. Probe each candidate with
+`-c "import sys; print(sys.version); print(sys.executable); sys.exit(0 if sys.version_info >= (3, 10) else 1)"`.
+A missing command, nonzero exit or 10-second timeout tries the next candidate.
+Record the selected interpreter, its version and `sys.executable`, and reuse the
+same interpreter for every command in this request, including evaluation,
+migration, validator and the verified embedded handoff. Prefer its resolved
+executable path after discovery so PATH changes do not select another Python.
+The command examples below use `python` as this logical placeholder; replace
+it with the selected command, preserving its argument order. At the start of
+every maintenance task, record the resolved Skill root and CLI path, run
+`<selected-python> {baseDir}/tools/agent_scaffold.py --version`, and require
+tool version `3.2.0` or newer. When `tools/release.json` exists,
 its version and SHA-256 entries must match all bundled tools and evaluation
 rule source before continuing.
+Pass executable, script and parameters as separate argv items when the host
+supports that API; use no shell expansion. With a shell, quote every path and
+keep `py -3` as two arguments. PowerShell needs `&` before a quoted executable:
+`& 'C:/Python/python.exe' 'C:/My Skill/tools/agent_scaffold.py' --help`.
+In macOS Zsh/Bash use
+`python3 '/Users/name/My Skill/tools/agent_scaffold.py' --help`.
+Never paste PowerShell syntax into Zsh or change shell/profile settings.
 If multiple same-named installations are visible, use the selected verified
 Skill; conflicting versions or hashes block maintenance. Use the external CLI
 until a successful Release preflight hands off to the target architect.
@@ -216,13 +249,21 @@ An arbitrary `tools/agent_scaffold.py` inside a target workspace is not this
 Skill's CLI. The verified `.agent/architect/tools/agent_scaffold.py` becomes
 the maintenance CLI only after the explicit handoff described below.
 
-First run `python {baseDir}/tools/agent_scaffold.py --help`. If Python, the CLI file, or
-its required standard-library modules cannot be found or the command fails,
-report `cli-unavailable` with the attempted executable/path and the actual
-error. If the version or release check fails, report `skill-version-conflict`
+First run `<selected-python> {baseDir}/tools/agent_scaffold.py --help`. If no
+candidate Python interpreter, the CLI file, or its required standard-library
+modules can be found, or the command fails, report `cli-unavailable` with all
+attempted executables, the CLI path and the actual errors. If the version or
+release check fails, report `skill-version-conflict`
 with the selected Skill root, CLI path, detected version, and expected
 version/hash. Stop maintenance without editing the target manually; do not
-fall back to a target-workspace CLI.
+fall back to a target-workspace CLI. `cli-unavailable` is reported by the
+calling Agent even when Python cannot start; it is not a JSON promise from a
+process that never ran. Include the minimum Python version and the actual OS,
+shell, attempted argv, exit codes/stderr or launch errors. A verified Python
+with an unreadable CLI must not trigger fallback to another copy of the tools.
+Python, optional Git, host capabilities and directory permissions remain user
+prerequisites. On macOS, denied Desktop/Documents access may require the user
+to grant the host access in system settings; never grant it automatically.
 
 ## Required sequence
 
@@ -656,3 +697,9 @@ and manifest. Development packaging tools are not runtime dependencies.
 Ordinary domain conversations and archive actions do not perform a Release
 lookup or write through this CLI; source, path, manifest and hash failures stop
 maintenance with a structured diagnostic.
+
+Windows and macOS consume the same versioned payload and raw-byte hashes.
+Do not rewrite protected files or line endings on the receiver. Only package
+actually needed files; any future launcher must be covered by the manifest,
+protected scope, upgrade and restore. Static validation, tool execution on one
+OS and actual host execution on another are distinct evidence levels.

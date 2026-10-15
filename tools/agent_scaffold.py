@@ -30,7 +30,7 @@ import validate_scaffold
 
 
 SCHEMA_VERSION = 1
-TOOL_VERSION = "3.1.0"
+TOOL_VERSION = "3.2.0"
 MANIFEST_FILE = ".agent/scaffold-manifest.json"
 DESCRIPTION_FILE = validate_scaffold.DESCRIPTION_FILE
 ARCHITECT_ROOT = ".agent/architect/"
